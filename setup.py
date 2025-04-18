@@ -6,7 +6,6 @@ if 'CXX' not in os.environ:
     os.environ['CXX'] = 'g++'
     print("Set C++ compiler: g++")
 
-
 setup(
     name='torchff',
     classifiers=[
@@ -19,7 +18,23 @@ setup(
     ext_modules=[
         CUDAExtension(
             name='torchff_harmonic_bond',
-            sources=['csrc/bond/harmonic_bond_interface.cpp', 'csrc/bond/harmonic_bond_cpu.cpp', 'csrc/bond/harmonic_bond_cuda.cu'],
+            sources=[
+                'csrc/bond/harmonic_bond_interface.cpp',
+                'csrc/bond/harmonic_bond_cpu.cpp',
+                'csrc/bond/harmonic_bond_cuda.cu'
+            ],
+            extra_compile_args={
+                'cxx': ['-O3'],
+                'nvcc': ['-O3', '-arch=sm_80']
+            },
+        ),
+        CUDAExtension(
+            name='torchff_harmonic_angle',
+            sources=[
+                'csrc/angle/harmonic_angle_interface.cpp',
+                'csrc/angle/harmonic_angle_cpu.cpp',
+                'csrc/angle/harmonic_angle_cuda.cu'
+            ],
             extra_compile_args={
                 'cxx': ['-O3'],
                 'nvcc': ['-O3', '-arch=sm_80']
