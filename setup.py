@@ -24,6 +24,14 @@ setup(
                 'cxx': ['-O3'],
                 'nvcc': ['-O3', '-arch=sm_80']
             },
+        ),
+        CUDAExtension(
+            name='torchff_periodic_torsion',
+            sources=['csrc/torsion/periodic_torsion_interface.cpp', 'csrc/torsion/periodic_torsion_cuda.cu'],
+            extra_compile_args={
+                'cxx': ['-O3'],
+                'nvcc': ['-O3', '-arch=sm_80']
+            },
         )
     ],
     cmdclass={
