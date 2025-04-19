@@ -24,6 +24,7 @@ setup(
                 'cxx': ['-O3'],
                 'nvcc': ['-O3', '-arch=sm_80']
             },
+            include_dirs=[os.path.join(os.path.dirname(__file__), "csrc")]
         ),
         CUDAExtension(
             name='torchff_periodic_torsion',
@@ -32,6 +33,16 @@ setup(
                 'cxx': ['-O3'],
                 'nvcc': ['-O3', '-arch=sm_80']
             },
+            include_dirs=[os.path.join(os.path.dirname(__file__), "csrc")]
+        ),
+        CUDAExtension(
+            name='torchff_vdw',
+            sources=['csrc/vdw/lennard_jones_interface.cpp', 'csrc/vdw/lennard_jones_cuda.cu'],
+            extra_compile_args={
+                'cxx': ['-O3'],
+                'nvcc': ['-O3', '-arch=sm_80']
+            },
+            include_dirs=[os.path.join(os.path.dirname(__file__), "csrc")]
         )
     ],
     cmdclass={

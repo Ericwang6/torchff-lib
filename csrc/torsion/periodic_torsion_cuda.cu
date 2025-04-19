@@ -4,44 +4,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-
-template <typename scalar_t>
-__device__ __forceinline__ void cross_vec3(scalar_t* a, scalar_t* b, scalar_t* out) {
-    out[0] = a[1] * b[2] - a[2] * b[1];
-    out[1] = a[2] * b[0] - a[0] * b[2];
-    out[2] = a[0] * b[1] - a[1] * b[0];
-}
-
-template <typename scalar_t>
-__device__ __forceinline__ void diff_vec3(scalar_t* a, scalar_t* b, scalar_t* out) {
-    out[0] = a[0] - b[0];
-    out[1] = a[1] - b[1];
-    out[2] = a[2] - b[2];
-}
-
-template <typename scalar_t>
-__device__ __forceinline__ scalar_t dot_vec3(scalar_t* a, scalar_t* b) {
-    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-}
-
-template <typename scalar_t>
-__device__ __forceinline__ scalar_t norm_vec3(scalar_t* a) {
-    return sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
-}
-
-template <typename scalar_t>
-__device__ __forceinline__ void scalar_mult_vec3(scalar_t* vec, scalar_t s, scalar_t* out) {
-    out[0] = vec[0] * s;
-    out[1] = vec[1] * s;
-    out[2] = vec[2] * s;
-}
-
-template <typename scalar_t>
-__device__ __forceinline__ void add_vec3(scalar_t* a, scalar_t* b, scalar_t* out) {
-    out[0] = a[0] + b[0];
-    out[1] = a[1] + b[1];
-    out[2] = a[2] + b[2];
-}
+#include "common/vec3.cuh"
 
 
 template <typename scalar_t>
@@ -86,15 +49,15 @@ __global__ void periodic_torsion_cuda_kernel(
 
     scalar_t cosval = dot_vec3(n1, n2) / (norm_n1 * norm_n2);
     cosval = min(scalar_t(1.0), max(scalar_t(-1.0), cosval));
-    scalar_t phi = acos(cosval);
 
     scalar_t k = fc[index];
-    scalar_t phi0 = phase[index];
     int64_t n = per[index];
-    scalar_t p = n * phi - phi0;
+    scalar_t phi = acos(cosval);
+    phi = dot_vec3(n1, b3) > 0.0 ? phi : -phi;
+    phi = n * phi - phase[index];
     
-    scalar_t tmp1 = 1 + cos(p);
-    scalar_t tmp2 = k * sin(p);
+    scalar_t tmp1 = 1 + cos(phi);
+    scalar_t tmp2 = k * sin(phi);
     ene[index] = k * tmp1;
     scalar_t prefactor = tmp2 * n;
 
@@ -105,7 +68,7 @@ __global__ void periodic_torsion_cuda_kernel(
     for (int i = 0; i < 3; i++) {
         cgi = prefactor * norm_b2 / (norm_n1 * norm_n1) * n1[i];
         cgl = -prefactor * norm_b2 / (norm_n2 * norm_n2) * n2[i];
-        cgj = (aux1 - 1) * cgi - aux2 * cgl;
+        cgj = (-aux1 - 1) * cgi + aux2 * cgl;
         cgk = -cgi - cgj - cgl;
         atomicAdd(&coord_grad[offset_i + i], cgi);
         atomicAdd(&coord_grad[offset_j + i], cgj);
@@ -114,7 +77,7 @@ __global__ void periodic_torsion_cuda_kernel(
     }
 
     fc_grad[index] = tmp1;
-    phase_grad[index] = -tmp2;
+    phase_grad[index] = tmp2;
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> compute_periodic_torsion_cuda(
@@ -126,7 +89,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> compute_periodic_tors
 ) {
     int64_t ntors = torsions.size(0);
 
-    int block_dim = 1024;
+    int block_dim = 512;
     int grid_dim = (ntors + block_dim - 1) / block_dim;
 
     auto ene = at::zeros({ntors}, coords.options());
