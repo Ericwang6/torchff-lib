@@ -33,10 +33,6 @@ class LennardJones(nn.Module):
 ])
 def test_harmonic_bond(device, dtype, requires_grad):
     cutoff = 4.0
-    N = 100000
-    Npairs = 1000000
-    pairs = torch.randint(0, N-2, (Npairs, 2), device=device)
-    pairs[:, 1] = pairs[:, 0] + 1
 
     box = torch.tensor([
         [10.0, 0.0, 0.0],
@@ -44,13 +40,20 @@ def test_harmonic_bond(device, dtype, requires_grad):
         [0.0, 0.0, 10.0]
     ], requires_grad=False, dtype=dtype, device=device)
     
+    N = 100000
     coords = (np.random.rand(N, 3) * 10.0).tolist()
     coords = torch.tensor(coords, requires_grad=requires_grad, device=device, dtype=dtype)
+    # coords = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.5]], requires_grad=requires_grad, device=device, dtype=dtype)
 
-    sigma = (np.random.rand(N) / 100 + 0.001).tolist()
+    Npairs = 100000
+    pairs = torch.randint(0, N-2, (Npairs, 2), device=device)
+    pairs[:, 1] = pairs[:, 0] + 1
+    # pairs = torch.tensor([[0, 1]], dtype=torch.long, device=device)
+
+    sigma = (np.random.rand(N) + 0.001).tolist()
     sigma = torch.tensor(sigma, device=device, dtype=dtype, requires_grad=requires_grad)
 
-    epsilon = (np.random.rand(N) / 100 + 0.001).tolist()
+    epsilon = (np.random.rand(N) + 0.001).tolist()
     epsilon = torch.tensor(epsilon, device=device, dtype=dtype, requires_grad=requires_grad)
 
     lj = LennardJones()
@@ -71,7 +74,7 @@ def test_harmonic_bond(device, dtype, requires_grad):
         grads = [coords.grad.clone().detach(), sigma.grad.clone().detach(), epsilon.grad.clone().detach()]
 
         for c, g, gref in zip(['coord', 'sigma', 'epsilon'], grads, grads_ref):
-            assert torch.allclose(g, gref, atol=1e-5), f'Gradient {c} not the same'
+            assert torch.allclose(g, gref, atol=1e-5), f'Gradient {c} not the same (max deviation {torch.max(torch.abs(g - gref))})'
 
     # Test times
     Ntimes = 1000

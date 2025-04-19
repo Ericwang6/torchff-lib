@@ -56,8 +56,8 @@ __global__ void lennard_jones_cuda_kernel(
     
     tmp[0] = 24 * epsilon_ij * sigma_ij_6 * (2 * sigma_ij_6 * rinv6 * rinv6 - rinv6);
     scalar_t sigma_deriv = tmp[0] / 2 / sigma_ij;
-    atomicAdd(&sigma[i], sigma_deriv);
-    atomicAdd(&sigma[j], sigma_deriv);
+    atomicAdd(&sigma_grad[i], sigma_deriv);
+    atomicAdd(&sigma_grad[j], sigma_deriv);
 
     tmp[0] = tmp[0] * rinv * rinv;
     scalar_t g;
@@ -82,7 +82,7 @@ std::vector<at::Tensor> compute_lennard_jones_cuda(
 
     at::Tensor box_inv = at::linalg_inv(box);
 
-    int block_dim = 512;
+    int block_dim = 256;
     int grid_dim = (npairs + block_dim - 1) / block_dim;
 
     auto ene = at::zeros({npairs}, coords.options());
