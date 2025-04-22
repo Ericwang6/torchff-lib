@@ -9,12 +9,7 @@ __device__ void apply_pbc_triclinic(scalar_t* vec, scalar_t* box, scalar_t* box_
     scalar_t s[3];
     for (int i = 0; i < 3; ++i) {
         s[i] = dot_vec3(&box_inv[i * 3], vec);
-        if ( s[i] > 0.5 ) {
-            s[i] -= 1.0;
-        }
-        else if ( s[i] < -0.5 ) {
-            s[i] += 1.0;
-        }
+        s[i] -= round(s[i]);
     }
     for (int i = 0; i < 3; ++i) {
         out[i] = dot_vec3(&box[i * 3], s);
@@ -23,37 +18,16 @@ __device__ void apply_pbc_triclinic(scalar_t* vec, scalar_t* box, scalar_t* box_
 
 template <typename scalar_t>
 __device__ void apply_pbc_orthorhombic(scalar_t* vec, scalar_t* box, scalar_t* out) {
-    scalar_t s;
-    scalar_t half_box;
-    for (int i = 0; i < 3; ++i) {
-        half_box = box[i] / 2;
-        if (vec[i] > half_box) {
-            out[i] = vec[i] - box;
-        }
-        else if (vec[i] < -half_box) {
-            out[i] = vec[i] + box;
-        }
-        else {
-            out[i] = vec[i];
-        }
-    }
+    out[0] = vec[0] - round(vec[0] / box[0]) * box[0];
+    out[1] = vec[1] - round(vec[1] / box[1]) * box[1];
+    out[2] = vec[2] - round(vec[2] / box[2]) * box[2];
 }
 
 template <typename scalar_t>
 __device__ void apply_pbc_cubic(scalar_t* vec, scalar_t box, scalar_t* out) {
-    scalar_t s;
-    scalar_t half_box = box / 2;
-    for (int i = 0; i < 3; ++i) {
-        if (vec[i] > half_box) {
-            out[i] = vec[i] - box;
-        }
-        else if (vec[i] < -half_box) {
-            out[i] = vec[i] + box;
-        }
-        else {
-            out[i] = vec[i];
-        }
-    }
+    out[0] = vec[0] - round(vec[0] / box) * box;
+    out[1] = vec[1] - round(vec[1] / box) * box;
+    out[2] = vec[2] - round(vec[2] / box) * box;
 }
 
 #endif
