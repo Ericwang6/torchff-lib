@@ -43,6 +43,15 @@ setup(
                 'nvcc': ['-O3', '-arch=sm_80']
             },
             include_dirs=[os.path.join(os.path.dirname(__file__), "csrc")]
+        ),
+        CUDAExtension(
+            name='torchff_nblist',
+            sources=['csrc/nblist/nblist_interface.cpp', 'csrc/nblist/nblist_nsquared_cuda.cu'],
+            extra_compile_args={
+                'cxx': ['-O3'],
+                'nvcc': ['-O3', '-arch=sm_80']
+            },
+            include_dirs=[os.path.join(os.path.dirname(__file__), "csrc")]
         )
     ],
     cmdclass={
