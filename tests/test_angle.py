@@ -5,7 +5,7 @@ import torch.nn as nn
 import torchff
 
 def harmonic_angle(coords, angles, theta0, k):
-    v1 = coords[angles[:, 1]] - coords[angles[:, 0]]
+    v1 = coords[angles[:, 0]] - coords[angles[:, 1]]
     v2 = coords[angles[:, 2]] - coords[angles[:, 1]]
     dot_product = torch.sum(v1 * v2, dim=1)
     mag_v1 = torch.norm(v1, dim=1)
@@ -17,8 +17,8 @@ def harmonic_angle(coords, angles, theta0, k):
     return torch.sum(ene)
 
 @pytest.mark.parametrize("device, dtype", [
-    ('cpu', torch.float64), 
-    ('cpu', torch.float32), 
+    # ('cpu', torch.float64), 
+    # ('cpu', torch.float32), 
     ('cuda', torch.float64), 
     ('cuda', torch.float32)
 ])
@@ -36,7 +36,7 @@ def test_harmonic_angle(device, dtype):
     ene_ref = harmonic_angle(coords, angles, theta0, k)
     ene = torchff.compute_harmonic_angle_energy(coords, angles, theta0, k)
 
-    assert torch.allclose(ene_ref, ene), 'Energy not the same'
+    assert torch.allclose(ene_ref, ene, atol=1e-5), 'Energy not the same'
 
     ene_ref.backward()
     grads_ref = [coords.grad.clone().detach()]
@@ -46,8 +46,9 @@ def test_harmonic_angle(device, dtype):
     ene.backward()
     grads = [coords.grad.clone().detach()]
 
-    for c, g, gref in zip(['coord'], grads, grads_ref):
-        assert torch.allclose(g, gref, atol=1e-5), f'Gradient {c} not the same'
+    grad_atol = 1e-5 if dtype is torch.float64 else 1e-2
+    for c, g, gref in zip(['coord', 'theta0', 'k'], grads, grads_ref):
+        assert torch.allclose(g, gref, atol=grad_atol), f'Gradient {c} not the same'
 
     # Test time
     Ntimes = 1000

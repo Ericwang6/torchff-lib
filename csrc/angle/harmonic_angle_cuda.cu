@@ -79,29 +79,25 @@ __global__ void harmonic_angle_energy_grad_cuda_kernel(
     scalar_t dtheta = theta - theta0[index];
     scalar_t prefix = k_ * dtheta * dtheta_dcos / (v1_norm * v2_norm);
 
-    scalar_t g1x = prefix * (v2x / v1_norm - cos_theta * v1x / v1_norm);
-    scalar_t g1y = prefix * (v2y / v1_norm - cos_theta * v1y / v1_norm);
-    scalar_t g1z = prefix * (v2z / v1_norm - cos_theta * v1z / v1_norm);
+    scalar_t g1x = prefix * (v2x - cos_theta * v1x / v1_norm * v2_norm);
+    scalar_t g1y = prefix * (v2y - cos_theta * v1y / v1_norm * v2_norm);
+    scalar_t g1z = prefix * (v2z - cos_theta * v1z / v1_norm * v2_norm);
 
-    scalar_t g2x = prefix * (-v1x / v1_norm - v2x / v2_norm + cos_theta * (v1x / v1_norm + v2x / v2_norm));
-    scalar_t g2y = prefix * (-v1y / v1_norm - v2y / v2_norm + cos_theta * (v1y / v1_norm + v2y / v2_norm));
-    scalar_t g2z = prefix * (-v1z / v1_norm - v2z / v2_norm + cos_theta * (v1z / v1_norm + v2z / v2_norm));
+    scalar_t g3x = prefix * (v1x - cos_theta * v2x / v2_norm * v1_norm);
+    scalar_t g3y = prefix * (v1y - cos_theta * v2y / v2_norm * v1_norm);
+    scalar_t g3z = prefix * (v1z - cos_theta * v2z / v2_norm * v1_norm);
 
-    scalar_t g3x = prefix * (v1x / v2_norm - cos_theta * v2x / v2_norm);
-    scalar_t g3y = prefix * (v1y / v2_norm - cos_theta * v2y / v2_norm);
-    scalar_t g3z = prefix * (v1z / v2_norm - cos_theta * v2z / v2_norm);
+    atomicAdd(&coord_grad[offset_0],     g1x);
+    atomicAdd(&coord_grad[offset_0 + 1], g1y);
+    atomicAdd(&coord_grad[offset_0 + 2], g1z);
 
-    atomicAdd(&coord_grad[offset_0],     -g1x);
-    atomicAdd(&coord_grad[offset_0 + 1], -g1y);
-    atomicAdd(&coord_grad[offset_0 + 2], -g1z);
+    atomicAdd(&coord_grad[offset_1],     -g1x-g3x);
+    atomicAdd(&coord_grad[offset_1 + 1], -g1y-g3y);
+    atomicAdd(&coord_grad[offset_1 + 2], -g1z-g3z);
 
-    atomicAdd(&coord_grad[offset_1],     -g2x);
-    atomicAdd(&coord_grad[offset_1 + 1], -g2y);
-    atomicAdd(&coord_grad[offset_1 + 2], -g2z);
-
-    atomicAdd(&coord_grad[offset_2],     -g3x);
-    atomicAdd(&coord_grad[offset_2 + 1], -g3y);
-    atomicAdd(&coord_grad[offset_2 + 2], -g3z);
+    atomicAdd(&coord_grad[offset_2],     g3x);
+    atomicAdd(&coord_grad[offset_2 + 1], g3y);
+    atomicAdd(&coord_grad[offset_2 + 2], g3z);
 
     k_grad[index] = dtheta * dtheta / 2;
     theta0_grad[index] = -k_ * dtheta;
@@ -146,7 +142,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> compute_harmonic_angle_energy_gra
 ) {
     int64_t nangles = triplets.size(0);
 
-    int block_dim = 1024;
+    int block_dim = 512;
     int grid_dim = (nangles + block_dim - 1) / block_dim;
 
     auto coord_grad = at::zeros_like(coords, coords.options());
