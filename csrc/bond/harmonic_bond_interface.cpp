@@ -1,7 +1,7 @@
 #include <pybind11/pybind11.h>
 #include <torch/library.h>
 
-TORCH_LIBRARY(torchff, m) {
+TORCH_LIBRARY_FRAGMENT(torchff, m) {
     m.def("compute_harmonic_bond_energy(Tensor coords, Tensor pairs, Tensor b0, Tensor k) -> Tensor");
     m.def("compute_harmonic_bond_energy_grad(Tensor coords, Tensor pairs, Tensor b0, Tensor k) -> (Tensor, Tensor, Tensor)");
 }
