@@ -112,7 +112,7 @@ std::vector<at::Tensor> compute_coulomb_cuda(
 }
 
 
-TORCH_LIBRARY_IMPL(torchff, Autograd, m) {
+TORCH_LIBRARY_IMPL(torchff, AutogradCUDA, m) {
     m.impl("compute_coulomb_energy", compute_coulomb_cuda);
 }
 
