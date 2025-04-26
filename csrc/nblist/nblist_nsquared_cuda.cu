@@ -59,14 +59,12 @@ at::Tensor build_neighbor_list_nsquared_cuda(
         max_npairs_ = static_cast<int32_t>(max_npairs);
     }
 
-    int32_t *d_npairs;
-    cudaMalloc(&d_npairs, sizeof(int32_t));
-    cudaMemset(d_npairs, 0, sizeof(int32_t));
+    at::Tensor npairs = at::zeros({1}, coords.options().dtype(at::kInt));
 
     int block_dim = 128;
     int grid_dim = (natoms * (natoms - 1) / 2 + block_dim - 1) / block_dim;
 
-    at::Tensor pairs = at::empty({max_npairs_, 2}, coords.options().dtype(at::kInt));
+    at::Tensor pairs = at::full({max_npairs_, 2}, -1, coords.options().dtype(at::kInt));
     AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "build_neighbor_list_nsquared_cuda", ([&] {
         build_neighbor_list_nsquared_kernel<scalar_t><<<grid_dim, block_dim>>>(
             coords.data_ptr<scalar_t>(),
@@ -74,7 +72,7 @@ at::Tensor build_neighbor_list_nsquared_cuda(
             box_inv.data_ptr<scalar_t>(),
             static_cast<scalar_t>(cutoff * cutoff),
             pairs.data_ptr<int32_t>(),
-            d_npairs,
+            npairs.data_ptr<int32_t>(),
             natoms,
             max_npairs_
         );
@@ -85,10 +83,8 @@ at::Tensor build_neighbor_list_nsquared_cuda(
     TORCH_CHECK(err == cudaSuccess, "CUDA kernel failed: ", cudaGetErrorString(err));
 
     // check if the number of pairs exceeds the capacity
-    int32_t npairs_found = 0;
-    cudaMemcpy(&npairs_found, d_npairs, sizeof(int32_t), cudaMemcpyDeviceToHost);
+    int32_t npairs_found = npairs[0].item<int32_t>();
     TORCH_CHECK(npairs_found <= max_npairs_, "Too many neighbor pairs found. Maximum is " + std::to_string(max_npairs_), " but found " + std::to_string(npairs_found));
-    cudaFree(d_npairs);
 
     return pairs.index({at::indexing::Slice(0, npairs_found), at::indexing::Slice()});
 }
