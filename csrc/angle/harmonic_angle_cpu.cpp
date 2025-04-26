@@ -68,45 +68,41 @@ void harmonic_angle_energy_grad_cpu_kernel(
         scalar_t cos_theta = dot_product / (v1_norm * v2_norm);
         scalar_t theta = acos(cos_theta);
 
-        scalar_t sin_theta = sqrt(1 - cos_theta * cos_theta);
-        scalar_t dtheta_dcos = -1 / sin_theta;
+	scalar_t sin_theta = sqrt(1 - cos_theta * cos_theta);
+	scalar_t dtheta_dcos = -1 / sin_theta;
 
-        scalar_t k_ = k[index];
-        scalar_t dtheta = theta - theta0[index];
-        scalar_t prefix = k_ * dtheta * dtheta_dcos / (v1_norm * v2_norm);
+	scalar_t k_ = k[index];
+	scalar_t dtheta = theta - theta0[index];
+	scalar_t prefix = k_ * dtheta * dtheta_dcos / (v1_norm * v2_norm);
+	
+	scalar_t g1x = prefix * (v2x - cos_theta * v1x / v1_norm * v2_norm);
+	scalar_t g1y = prefix * (v2y - cos_theta * v1y / v1_norm * v2_norm);
+	scalar_t g1z = prefix * (v2z - cos_theta * v1z / v1_norm * v2_norm);
 
-        scalar_t g1x = prefix * (v2x / v1_norm - cos_theta * v1x / v1_norm);
-        scalar_t g1y = prefix * (v2y / v1_norm - cos_theta * v1y / v1_norm);
-        scalar_t g1z = prefix * (v2z / v1_norm - cos_theta * v1z / v1_norm);
-
-        scalar_t g2x = prefix * (-v1x / v1_norm - v2x / v2_norm + cos_theta * (v1x / v1_norm + v2x / v2_norm));
-        scalar_t g2y = prefix * (-v1y / v1_norm - v2y / v2_norm + cos_theta * (v1y / v1_norm + v2y / v2_norm));
-        scalar_t g2z = prefix * (-v1z / v1_norm - v2z / v2_norm + cos_theta * (v1z / v1_norm + v2z / v2_norm));
-
-        scalar_t g3x = prefix * (v1x / v2_norm - cos_theta * v2x / v2_norm);
-        scalar_t g3y = prefix * (v1y / v2_norm - cos_theta * v2y / v2_norm);
-        scalar_t g3z = prefix * (v1z / v2_norm - cos_theta * v2z / v2_norm);
+	scalar_t g3x = prefix * (v1x - cos_theta * v2x / v2_norm * v1_norm);
+	scalar_t g3y = prefix * (v1y - cos_theta * v2y / v2_norm * v1_norm);
+	scalar_t g3z = prefix * (v1z - cos_theta * v2z / v2_norm * v1_norm);
 
         #pragma omp atomic
-        coord_grad[offset_0]     -= g1x;
+        coord_grad[offset_0] += g1x;
         #pragma omp atomic
-        coord_grad[offset_0 + 1] -= g1y;
+        coord_grad[offset_0 + 1] += g1y;
         #pragma omp atomic
-        coord_grad[offset_0 + 2] -= g1z;
+        coord_grad[offset_0 + 2] += g1z;
 
         #pragma omp atomic
-        coord_grad[offset_1]     -= g2x;
+        coord_grad[offset_1] += -g1x -g3x;
         #pragma omp atomic
-        coord_grad[offset_1 + 1] -= g2y;
+        coord_grad[offset_1 + 1] += -g1y -g3y;
         #pragma omp atomic
-        coord_grad[offset_1 + 2] -= g2z;
+        coord_grad[offset_1 + 2] += -g1z -g3z;
 
         #pragma omp atomic
-        coord_grad[offset_2]     -= g3x;
+        coord_grad[offset_2] += g3x;
         #pragma omp atomic
-        coord_grad[offset_2 + 1] -= g3y;
+        coord_grad[offset_2 + 1] += g3y;
         #pragma omp atomic
-        coord_grad[offset_2 + 2] -= g3z;
+        coord_grad[offset_2 + 2] += g3z;
 
         k_grad[index] = dtheta * dtheta / 2;
         theta0_grad[index] = -k_ * dtheta;

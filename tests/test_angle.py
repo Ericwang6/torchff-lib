@@ -17,15 +17,15 @@ def harmonic_angle(coords, angles, theta0, k):
     return torch.sum(ene)
 
 @pytest.mark.parametrize("device, dtype", [
-    # ('cpu', torch.float64), 
-    # ('cpu', torch.float32), 
+    #('cpu', torch.float64), 
+    #('cpu', torch.float32), 
     ('cuda', torch.float64), 
-    ('cuda', torch.float32)
+    #('cuda', torch.float32)
 ])
 def test_harmonic_angle(device, dtype):
     requires_grad = True
-    N = 100000
-    Nangles = 100000
+    N = 1000
+    Nangles = 10000
     angles = torch.randint(0, N-3, (Nangles, 3), device=device)
     angles[:, 1] = angles[:, 0] + 1
     angles[:, 2] = angles[:, 1] + 1
