@@ -2,7 +2,7 @@
 #include <torch/library.h>
 
 TORCH_LIBRARY_FRAGMENT(torchff, m) {
-    m.def("coulomb_cuda_kernel(Tensor coords, Tensor charges, Tensor pairs, Tensor box, Tensor epsilon, float cutoff) -> Tensor[]");
+    m.def("compute_coulomb_energy(Tensor coords, Tensor charges, Tensor pairs, Tensor box, Tensor epsilon, float cutoff) -> Tensor[]");
 }
 
 PYBIND11_MODULE(torchff_coulomb, m) {

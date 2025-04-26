@@ -55,8 +55,8 @@ def test_coulomb(device, dtype, requires_grad):
     epsilon = [np.random.rand()]
     epsilon = torch.tensor(epsilon, device=device, dtype=dtype, requires_grad=requires_grad)
 
-    c = Coulomb()
-    ene_ref = c(coords,charges, pairs, box, epsilon, cutoff)
+    coul = Coulomb()
+    ene_ref = coul(coords,charges, pairs, box, epsilon, cutoff)
     ene = torchff.compute_coulomb_energy(coords,charges, pairs, box, epsilon, cutoff)
 
     assert torch.allclose(ene_ref, ene), 'Energy not the same'
@@ -66,13 +66,12 @@ def test_coulomb(device, dtype, requires_grad):
         grads_ref = [coords.grad.clone().detach(), charges.grad.clone().detach() , epsilon.grad.clone().detach()]
 
         coords.grad.zero_()
-        sigma.grad.zero_()
         epsilon.grad.zero_()
 
         ene.backward()
         grads = [coords.grad.clone().detach(), charges.grad.clone().detach(), epsilon.grad.clone().detach()]
 
-        for c, g, gref in zip(['coord', 'sigma', 'epsilon'], grads, grads_ref):
+        for c, g, gref in zip(['coord', 'charge', 'epsilon'], grads, grads_ref):
             assert torch.allclose(g, gref, atol=1e-5), f'Gradient {c} not the same (max deviation {torch.max(torch.abs(g - gref))})'
 
     # Test times
@@ -88,7 +87,7 @@ def test_coulomb(device, dtype, requires_grad):
 
         start = time.time()
         for _ in range(Ntimes):
-            ene_ref = c(coords, charges, pairs, box, epsilon, cutoff)
+            ene_ref = coul(coords, charges, pairs, box, epsilon, cutoff)
             ene_ref.backward()
         end = time.time()
         print(f"torch time: {(end-start)/Ntimes*1000:.5f} ms")
@@ -101,6 +100,6 @@ def test_coulomb(device, dtype, requires_grad):
 
         start = time.time()
         for _ in range(Ntimes):
-            ene_ref = c(coords, charges, pairs, box, epsilon, cutoff)
+            ene_ref = coul(coords, charges, pairs, box, epsilon, cutoff)
         end = time.time()
         print(f"torch time: {(end-start)/Ntimes*1000:.5f} ms")

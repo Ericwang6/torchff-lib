@@ -17,7 +17,7 @@ class CoulombFunction(torch.autograd.Function):
         return (
             coord_grad * grad_outputs, 
             None, None,
-            sigma_grad * grad_outputs, 
+            charge_grad * grad_outputs, 
             epsilon_grad * grad_outputs,
             None
         )
