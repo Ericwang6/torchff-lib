@@ -18,7 +18,6 @@ __global__ void harmonic_bond_energy_cuda_kernel(scalar_t* coords, int64_t* pair
     scalar_t dy = coords_1[1] - coords_0[1];
     scalar_t dz = coords_1[2] - coords_0[2];
     scalar_t b = sqrt(dx * dx + dy * dy + dz * dz);
-    // atomicAdd(ene, pow(b - b0[index] , 2) * k[index] / 2);
     ene[index] = pow(b - b0[index] , 2) * k[index] / 2;
 }
 
@@ -63,8 +62,6 @@ __global__ void harmonic_bond_energy_grad_cuda_kernel(
     b0_grad[index] = -k_ * db;
 }
 
-
-
 at::Tensor compute_harmonic_bond_energy_cuda(
     at::Tensor& coords,
     at::Tensor& pairs,
@@ -89,9 +86,9 @@ at::Tensor compute_harmonic_bond_energy_cuda(
         );
     }));
 
+    cudaDeviceSynchronize();
     cudaError_t err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "CUDA kernel failed: ", cudaGetErrorString(err));
-    cudaDeviceSynchronize();
 
     return at::sum(ene);
 }
