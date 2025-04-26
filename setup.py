@@ -24,7 +24,17 @@ setup(
                 'cxx': ['-O3'],
                 'nvcc': ['-O3', '-arch=sm_80']
             },
-        )
+            include_dirs=[os.path.join(os.path.dirname(__file__), "csrc")]
+        ),
+        CUDAExtension(
+            name='torchff_coulomb',
+            sources=['csrc/coulomb/coulomb_interface.cpp', 'csrc/coulomb/coulomb_cuda.cu'],
+            extra_compile_args={
+                'cxx': ['-O3'],
+                'nvcc': ['-O3', '-arch=sm_80']
+            },
+            include_dirs=[os.path.join(os.path.dirname(__file__), "csrc")]
+        ),
     ],
     cmdclass={
         'build_ext': BuildExtension
