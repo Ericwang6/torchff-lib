@@ -162,5 +162,5 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> compute_harmonic_angle_energy_gra
 
 TORCH_LIBRARY_IMPL(torchff, AutogradCPU, m) {
     m.impl("compute_harmonic_angle_energy", compute_harmonic_angle_energy_cpu);
-    m.impl("compute_harmonic_angle_energy_grad", compute_harmonic_angle_energy_grad_cpu);
+    // m.impl("compute_harmonic_angle_energy_grad", compute_harmonic_angle_energy_grad_cpu);
 }

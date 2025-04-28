@@ -3,7 +3,7 @@
 
 TORCH_LIBRARY_FRAGMENT(torchff, m) {
     m.def("compute_harmonic_angle_energy(Tensor coords, Tensor triplets, Tensor theta0, Tensor k) -> Tensor");
-    m.def("compute_harmonic_angle_energy_grad(Tensor coords, Tensor triplets, Tensor theta0, Tensor k) -> (Tensor, Tensor, Tensor)");
+    // m.def("compute_harmonic_angle_energy_grad(Tensor coords, Tensor triplets, Tensor theta0, Tensor k) -> (Tensor, Tensor, Tensor)");
 }
 
 PYBIND11_MODULE(torchff_harmonic_angle, m) {
