@@ -28,8 +28,8 @@ class LennardJones(nn.Module):
 @pytest.mark.parametrize("device, dtype, requires_grad", [
     # ('cpu', torch.float64), 
     # ('cpu', torch.float32), 
+    ('cuda', torch.float32, True),
     ('cuda', torch.float64, True), 
-    ('cuda', torch.float32, True)
 ])
 def test_harmonic_bond(device, dtype, requires_grad):
     cutoff = 4.0
@@ -46,11 +46,11 @@ def test_harmonic_bond(device, dtype, requires_grad):
     # coords = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.5]], requires_grad=requires_grad, device=device, dtype=dtype)
 
     Npairs = 100000
-    pairs = torch.randint(0, N-2, (Npairs, 2), device=device)
+    pairs = torch.randint(0, N-2, (Npairs, 2), device=device, dtype=torch.int32)
     pairs[:, 1] = pairs[:, 0] + 1
     # pairs = torch.tensor([[0, 1]], dtype=torch.long, device=device)
 
-    sigma = (np.random.rand(N) + 0.001).tolist()
+    sigma = (np.random.rand(N) * 0.3 + 0.001).tolist()
     sigma = torch.tensor(sigma, device=device, dtype=dtype, requires_grad=requires_grad)
 
     epsilon = (np.random.rand(N) + 0.001).tolist()

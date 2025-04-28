@@ -9,7 +9,7 @@ import torchff
 @torch.compile
 class Coulomb(nn.Module):
 
-    def forward(self, coords, charges ,pairs, box, epsilon, cutoff):
+    def forward(self, coords, pairs, box, charges, prefac, cutoff, do_shift=True):
         # box in row major: [[ax, ay, az], [bx, by, bz], [cx, cy, cz]]
         drVecs = coords[pairs[:, 0]] - coords[pairs[:, 1]]
         boxInv = torch.linalg.inv(box)
@@ -18,16 +18,18 @@ class Coulomb(nn.Module):
         drVecsPBC = torch.matmul(dsVecsPBC, box)
         dr = torch.norm(drVecsPBC, dim=1)
         mask = dr <= cutoff
-        tmp = 1.0 / (4.0 * torch.pi * (epsilon)* dr)
-        ene = tmp*charges[pairs[:, 0]]*charges[pairs[:, 1]]
-        return torch.sum(ene * mask)
+        rinv = 1 / dr
+        if do_shift:
+            rinv -= 1 / cutoff
+        ene = charges[pairs[:, 0]] * charges[pairs[:, 1]]* rinv
+        return torch.sum(ene * mask) * prefac
 
 
 @pytest.mark.parametrize("device, dtype, requires_grad", [
     # ('cpu', torch.float64), 
     # ('cpu', torch.float32), 
+    ('cuda', torch.float32, True),
     ('cuda', torch.float64, True), 
-    ('cuda', torch.float32, True)
 ])
 def test_coulomb(device, dtype, requires_grad):
     cutoff = 4.0
@@ -42,36 +44,35 @@ def test_coulomb(device, dtype, requires_grad):
     coords = (np.random.rand(N, 3) * 10.0).tolist()
     coords = torch.tensor(coords, requires_grad=requires_grad, device=device, dtype=dtype)
 
-    charges = (np.random.rand(N)).tolist()
+    charges = (np.random.rand(N) + 0.001).tolist()
     charges = torch.tensor(charges, requires_grad=requires_grad, device=device, dtype=dtype)
     # coords = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.5]], requires_grad=requires_grad, device=device, dtype=dtype)
 
     Npairs = 100000
-    pairs = torch.randint(0, N-2, (Npairs, 2), device=device)
+    pairs = torch.randint(0, N-2, (Npairs, 2), device=device, dtype=torch.int32)
     pairs[:, 1] = pairs[:, 0] + 1
     # pairs = torch.tensor([[0, 1]], dtype=torch.long, device=device)
 
-
-    epsilon = [np.random.rand()]
-    epsilon = torch.tensor(epsilon, device=device, dtype=dtype, requires_grad=requires_grad)
+    prefac = torch.tensor(20.0, device=device, requires_grad=requires_grad, dtype=dtype)
 
     coul = Coulomb()
-    ene_ref = coul(coords,charges, pairs, box, epsilon, cutoff)
-    ene = torchff.compute_coulomb_energy(coords,charges, pairs, box, epsilon, cutoff)
+    ene_ref = coul(coords, pairs, box, charges, prefac, cutoff)
+    ene = torchff.compute_coulomb_energy(coords, pairs, box, charges, prefac, cutoff)
 
     assert torch.allclose(ene_ref, ene), 'Energy not the same'
 
     if requires_grad:
         ene_ref.backward()
-        grads_ref = [coords.grad.clone().detach(), charges.grad.clone().detach() , epsilon.grad.clone().detach()]
+        grads_ref = [coords.grad.clone().detach(), charges.grad.clone().detach() , prefac.grad.clone().detach()]
 
         coords.grad.zero_()
-        epsilon.grad.zero_()
+        charges.grad.zero_()
+        prefac.grad.zero_()
 
         ene.backward()
-        grads = [coords.grad.clone().detach(), charges.grad.clone().detach(), epsilon.grad.clone().detach()]
+        grads = [coords.grad.clone().detach(), charges.grad.clone().detach(), prefac.grad.clone().detach()]
 
-        for c, g, gref in zip(['coord', 'charge', 'epsilon'], grads, grads_ref):
+        for c, g, gref in zip(['coord', 'charge', 'prefac'], grads, grads_ref):
             assert torch.allclose(g, gref, atol=1e-5), f'Gradient {c} not the same (max deviation {torch.max(torch.abs(g - gref))})'
 
     # Test times
@@ -80,26 +81,26 @@ def test_coulomb(device, dtype, requires_grad):
     if requires_grad:
         start = time.time()
         for _ in range(Ntimes):
-            ene = torchff.compute_coulomb_energy(coords, charges, pairs, box, epsilon, cutoff)
+            ene = torchff.compute_coulomb_energy(coords, pairs, box, charges, prefac, cutoff)
             ene.backward()
         end = time.time()
         print(f"torchff time: {(end-start)/Ntimes*1000:.5f} ms")
 
         start = time.time()
         for _ in range(Ntimes):
-            ene_ref = coul(coords, charges, pairs, box, epsilon, cutoff)
+            ene_ref = coul(coords, pairs, box, charges, prefac, cutoff)
             ene_ref.backward()
         end = time.time()
         print(f"torch time: {(end-start)/Ntimes*1000:.5f} ms")
     else:
         start = time.time()
         for _ in range(Ntimes):
-            ene = torchff.compute_coulomb_energy(coords,charges, pairs, box, epsilon, cutoff)
+            ene = torchff.compute_coulomb_energy(coords, pairs, box, charges, prefac, cutoff)
         end = time.time()
         print(f"torchff time: {(end-start)/Ntimes*1000:.5f} ms")
 
         start = time.time()
         for _ in range(Ntimes):
-            ene_ref = coul(coords, charges, pairs, box, epsilon, cutoff)
+            ene_ref = coul(coords, pairs, box, charges, prefac, cutoff)
         end = time.time()
         print(f"torch time: {(end-start)/Ntimes*1000:.5f} ms")

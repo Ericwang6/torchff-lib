@@ -2,6 +2,13 @@ import torch
 import torchff_nblist
 
 
+def build_neighbor_list_nsquared(coords: torch.Tensor, box: torch.Tensor, cutoff: float, max_npairs: int = -1):
+    return torch.ops.torchff.build_neighbor_list_nsquared(coords, box, cutoff, max_npairs)
+
+def build_neighbor_list_cell_list(coords: torch.Tensor, box: torch.Tensor, cutoff: float, max_npairs: int = -1, cell_size: float = 0.4, padding: bool = False):
+    return torch.ops.torchff.build_neighbor_list_cell_list(coords, box, cutoff, max_npairs, cell_size, padding)
+
+
 if __name__ == '__main__':
     import numpy as np
     import time
@@ -26,20 +33,20 @@ if __name__ == '__main__':
     coords = torch.tensor(coords, requires_grad=requires_grad, device=device, dtype=dtype)
     
     Ntimes = 1000
+    # start = time.time()
+    # for _ in range(Ntimes):
+    #     pairs = getNeighborPairs(coords, cutoff, -1, box, False)[0]
+    # end = time.time()
+    # print(f"NNPOp time: {(end-start)/Ntimes*1000:.5f} ms")
+
+    # npairs_ref = int(pairs[pairs != -1].shape[0] / 2)
+
     start = time.time()
     for _ in range(Ntimes):
-        pairs = getNeighborPairs(coords, cutoff, -1, box, False)[0]
-    end = time.time()
-    print(f"NNPOp time: {(end-start)/Ntimes*1000:.5f} ms")
-
-    npairs_ref = int(pairs[pairs != -1].shape[0] / 2)
-
-    start = time.time()
-    for _ in range(Ntimes):
-        pairs = torch.ops.torchff.build_neighbor_list_nsquared(coords, box, cutoff, -1)
+        pairs = build_neighbor_list_nsquared(coords, box, cutoff, -1)
     end = time.time()
     print(f"torchff time: {(end-start)/Ntimes*1000:.5f} ms")
 
     npairs = pairs.shape[0]
 
-    print(npairs_ref, npairs)
+    # print(npairs_ref, npairs)

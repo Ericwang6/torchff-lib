@@ -3,3 +3,4 @@ from .angle import compute_harmonic_angle_energy
 from .coulomb import compute_coulomb_energy
 from .torsion import compute_periodic_torsion_energy
 from .vdw import compute_lennard_jones_energy
+from .nblist import build_neighbor_list_nsquared, build_neighbor_list_cell_list
