@@ -70,7 +70,7 @@ setup(
         ),
         CUDAExtension(
             name='torchff_nblist',
-            sources=['csrc/nblist/nblist_interface.cpp', 'csrc/nblist/nblist_nsquared_cuda.cu'],
+            sources=['csrc/nblist/nblist_interface.cpp', 'csrc/nblist/nblist_nsquared_cuda.cu', 'csrc/nblist/nblist_clist_cuda.cu'],
             extra_compile_args={
                 'cxx': ['-O3'],
                 'nvcc': ['-O3', '-arch=sm_80']

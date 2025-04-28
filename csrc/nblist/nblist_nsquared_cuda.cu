@@ -23,7 +23,7 @@ __global__ void build_neighbor_list_nsquared_kernel(
     if ( index >= natoms * (natoms - 1) / 2 ) {
         return;
     }
-    int32_t i = floor((sqrt(index * 8 + 1) + 1) / 2);
+    int32_t i = (int32_t)floor((sqrt(((double)index) * 8 + 1) + 1) / 2);
     // if (i * (i - 1) > 2 * index) i--;
     int32_t j = index - (i * (i - 1)) / 2;
 
@@ -35,7 +35,7 @@ __global__ void build_neighbor_list_nsquared_kernel(
     if ( dist2 > cutoff2 ) {
         return;
     }
-    int32_t i_pair = atomicAdd(npairs, 1);
+    int32_t i_pair = atomicAdd(npairs, 1) % max_npairs;
     pairs[i_pair * 2] = i;
     pairs[i_pair * 2 + 1] = j;
 }

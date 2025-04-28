@@ -251,7 +251,7 @@ at::Tensor build_neighbor_list_cell_list_cuda(
         );
     }));
     
-    if ( padding ) {
+    if ( !padding ) {
         cudaError_t err = cudaGetLastError();
         TORCH_CHECK(err == cudaSuccess, "CUDA kernel failed: ", cudaGetErrorString(err));
 
