@@ -5,7 +5,7 @@ import openmm.unit as unit
 
 
 dirname = os.path.dirname(__file__)
-pdb = app.PDBFile(os.path.join(dirname, 'water/water_100.pdb'))
+pdb = app.PDBFile(os.path.join(dirname, 'water/water_1000.pdb'))
 top = pdb.getTopology()
 pos = pdb.getPositions()
 
@@ -13,7 +13,7 @@ ff = app.ForceField('tip3p.xml')
 system = ff.createSystem(
     top,
     nonbondedMethod=app.CutoffPeriodic,
-    nonbondedCutoff=0.5*unit.nanometer,
+    nonbondedCutoff=0.3*unit.nanometer,
     constraints=None,
     rigidWater=False
 )
@@ -24,6 +24,13 @@ print("Box: ", top.getPeriodicBoxVectors())
 for idx in range(system.getNumForces()):
     f = system.getForce(idx)
     f.setForceGroup(idx)
+    if isinstance(f, mm.NonbondedForce):
+        f.setUseDispersionCorrection(False)
+        f.setUseSwitchingFunction(False)
+        f.setReactionFieldDielectric(1.0)
+        # for i in range(f.getNumParticles()):
+        #     p = f.getParticleParameters(i)
+        #     f.setParticleParameters(i, p[0], 0.2, 0.03)
 
 integrator = mm.LangevinMiddleIntegrator(298.15, 1.0, 0.0005)
 simulation = app.Simulation(top, system, integrator)
