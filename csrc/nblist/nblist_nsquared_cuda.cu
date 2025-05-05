@@ -41,36 +41,32 @@ __global__ void build_neighbor_list_nsquared_kernel(
 }
 
 
-at::Tensor build_neighbor_list_nsquared_cuda(
-    at::Tensor& coords,
-    at::Tensor& box,
-    double cutoff,
-    int64_t max_npairs
+std::tuple<at::Tensor, at::Tensor> build_neighbor_list_nsquared_cuda(
+    const at::Tensor& coords,
+    const at::Tensor& box,
+    const at::Scalar& cutoff,
+    const at::Scalar& max_npairs,
+    bool padding
 )
 {
     at::Tensor box_inv = at::linalg_inv(box);
     int32_t natoms = coords.size(0);
 
-    int32_t max_npairs_;
-    if ( max_npairs == -1 ) {
-        max_npairs_ = natoms * (natoms - 1) / 2;
-    }
-    else {
-        max_npairs_ = static_cast<int32_t>(max_npairs);
-    }
+    int32_t max_npairs_ = (max_npairs.toInt() < 0) ? natoms * (natoms - 1) / 2 : max_npairs.toInt();
 
     at::Tensor npairs = at::zeros({1}, coords.options().dtype(at::kInt));
 
-    int block_dim = 128;
-    int grid_dim = (natoms * (natoms - 1) / 2 + block_dim - 1) / block_dim;
+    int32_t block_dim = 128;
+    int32_t grid_dim = (natoms * (natoms - 1) / 2 + block_dim - 1) / block_dim;
 
     at::Tensor pairs = at::full({max_npairs_, 2}, -1, coords.options().dtype(at::kInt));
     AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "build_neighbor_list_nsquared_cuda", ([&] {
+        scalar_t cutoff2 = static_cast<scalar_t>(cutoff.toDouble() * cutoff.toDouble());
         build_neighbor_list_nsquared_kernel<scalar_t><<<grid_dim, block_dim>>>(
             coords.data_ptr<scalar_t>(),
             box.data_ptr<scalar_t>(),
             box_inv.data_ptr<scalar_t>(),
-            static_cast<scalar_t>(cutoff * cutoff),
+            cutoff2,
             pairs.data_ptr<int32_t>(),
             npairs.data_ptr<int32_t>(),
             natoms,
@@ -78,15 +74,21 @@ at::Tensor build_neighbor_list_nsquared_cuda(
         );
     }));
 
-    cudaDeviceSynchronize();
-    cudaError_t err = cudaGetLastError();
-    TORCH_CHECK(err == cudaSuccess, "CUDA kernel failed: ", cudaGetErrorString(err));
+    if ( !padding ) {
+        cudaDeviceSynchronize();
+        cudaError_t err = cudaGetLastError();
+        TORCH_CHECK(err == cudaSuccess, "CUDA kernel failed: ", cudaGetErrorString(err));
 
-    // check if the number of pairs exceeds the capacity
-    int32_t npairs_found = npairs[0].item<int32_t>();
-    TORCH_CHECK(npairs_found <= max_npairs_, "Too many neighbor pairs found. Maximum is " + std::to_string(max_npairs_), " but found " + std::to_string(npairs_found));
+        // check if the number of pairs exceeds the capacity
+        int32_t npairs_found = npairs[0].item<int32_t>();
+        TORCH_CHECK(npairs_found <= max_npairs_, "Too many neighbor pairs found. Maximum is " + std::to_string(max_npairs_), " but found " + std::to_string(npairs_found));
 
-    return pairs.index({at::indexing::Slice(0, npairs_found), at::indexing::Slice()});
+        return std::make_tuple(pairs.index({at::indexing::Slice(0, npairs_found), at::indexing::Slice()}), npairs);
+    }
+    else {
+        return std::make_tuple(pairs, npairs);
+    }
+    
 }
 
 
