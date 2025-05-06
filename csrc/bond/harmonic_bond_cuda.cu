@@ -25,12 +25,12 @@ __global__ void harmonic_bond_cuda_kernel(
     scalar_t* k_grad,
     scalar_t sign
 ) {
-
-    __shared__ scalar_t s_ene;
-    if (threadIdx.x == 0) {
-        s_ene = 0.0;
-    }
-    __syncthreads();
+    // Use built-in at::sum is faster
+    // __shared__ scalar_t s_ene;
+    // if (threadIdx.x == 0 && ene) {
+    //     s_ene = 0.0;
+    // }
+    // __syncthreads();
 
     int index = threadIdx.x + blockIdx.x * blockDim.x;
     if (index >= nbonds) {
@@ -53,9 +53,11 @@ __global__ void harmonic_bond_cuda_kernel(
     scalar_t gy = dy * prefix * sign;
     scalar_t gz = dz * prefix * sign;
 
-    // ene[index] = k_ * db * db / 2;
-    atomicAdd(&s_ene, k_ * db * db / 2);
-
+    if ( ene ) {
+        // atomicAdd(&s_ene, k_ * db * db / 2);
+        ene[index] = k_ * db * db / 2;
+    }
+    
     atomicAdd(&coord_grad[offset_0],      -gx);
     atomicAdd(&coord_grad[offset_0 + 1],  -gy);
     atomicAdd(&coord_grad[offset_0 + 2],  -gz);
@@ -71,10 +73,10 @@ __global__ void harmonic_bond_cuda_kernel(
         b0_grad[index] = -k_ * db;
     }
 
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        atomicAdd(ene, s_ene);
-    }
+    // __syncthreads();
+    // if (threadIdx.x == 0 && ene) {
+    //     atomicAdd(ene, s_ene);
+    // }
 }
 
 
@@ -93,7 +95,7 @@ public:
         int32_t block_dim = 1024;
         int32_t grid_dim = (nbonds + block_dim - 1) / block_dim;
 
-        at::Tensor e = at::zeros({}, coords.options());
+        at::Tensor e = at::zeros({nbonds}, coords.options());
         at::Tensor coord_grad = at::zeros_like(coords, coords.options());
         at::Tensor b0_grad = at::zeros_like(b0, b0.options());
         at::Tensor k_grad = at::zeros_like(k, k.options());
@@ -116,7 +118,7 @@ public:
             );
         }));
         
-        return e;
+        return at::sum(e);
     }
 
     static std::vector<at::Tensor> backward(
@@ -141,12 +143,11 @@ at::Tensor compute_harmonic_bond_energy_cuda(
 }
 
 
-void compute_harmonic_bond_energy_and_forces_cuda(
+void compute_harmonic_bond_forces_cuda(
     at::Tensor& coords,
     at::Tensor& bonds,
     at::Tensor& b0,
     at::Tensor& k,
-    at::Tensor& ene,
     at::Tensor& forces
 ) {
 
@@ -154,14 +155,14 @@ void compute_harmonic_bond_energy_and_forces_cuda(
     int32_t block_dim = 1024;
     int32_t grid_dim = (nbonds + block_dim - 1) / block_dim;
     auto stream = at::cuda::getCurrentCUDAStream();
-    AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "compute_harmonic_bond_energy_and_forces_cuda", ([&] {
+    AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "compute_harmonic_bond_forces_cuda", ([&] {
         harmonic_bond_cuda_kernel<scalar_t><<<grid_dim, block_dim, 0, stream>>>(
             coords.data_ptr<scalar_t>(),
             bonds.data_ptr<int32_t>(),
             b0.data_ptr<scalar_t>(),
             k.data_ptr<scalar_t>(),
             nbonds,
-            ene.data_ptr<scalar_t>(),
+            nullptr,
             forces.data_ptr<scalar_t>(),
             nullptr,
             nullptr,
@@ -173,5 +174,5 @@ void compute_harmonic_bond_energy_and_forces_cuda(
 
 TORCH_LIBRARY_IMPL(torchff, AutogradCUDA, m) {
     m.impl("compute_harmonic_bond_energy", compute_harmonic_bond_energy_cuda);
-    m.impl("compute_harmonic_bond_energy_and_forces", compute_harmonic_bond_energy_and_forces_cuda);
+    m.impl("compute_harmonic_bond_forces", compute_harmonic_bond_forces_cuda);
 }

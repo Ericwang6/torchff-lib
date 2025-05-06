@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import torchff
 
+from .utils import perf_op, check_op
+
 
 @torch.compile
 class HarmonicAngle(nn.Module):
@@ -37,36 +39,41 @@ def test_harmonic_angle(device, dtype):
     theta0 = torch.rand(Nangles, device=device, dtype=dtype, requires_grad=requires_grad)
     k = torch.rand(Nangles, device=device, dtype=dtype, requires_grad=requires_grad)
 
-    harmonic_angle = HarmonicAngle()
-    ene_ref = harmonic_angle(coords, angles, theta0, k)
-    ene = torchff.compute_harmonic_angle_energy(coords, angles, theta0, k)
+    harmonic_angle_ref = HarmonicAngle()
+    perf_op(
+        harmonic_angle_ref, 
+        coords, angles, theta0, k, 
+        desc='ref-harmonic-angle', 
+        run_backward=True, use_cuda_graph=True
+    )
+    perf_op(
+        torchff.compute_harmonic_angle_energy, 
+        coords, angles, theta0, k, 
+        desc='torchff-harmonic-angle', 
+        run_backward=True, use_cuda_graph=True
+    )
+    check_op(
+        torchff.compute_harmonic_angle_energy,
+        harmonic_angle_ref,
+        coords, angles, theta0, k, 
+        check_grad=True,
+        atol=1e-2 if dtype is torch.float32 else 1e-5
+    )
+    
+    forces = torch.zeros_like(coords, requires_grad=False)
+    torchff.compute_harmonic_angle_forces(coords, angles, theta0, k, forces)
+    coords.grad = None
+    e = harmonic_angle_ref(coords, angles, theta0, k)
+    e.backward()
+    assert torch.allclose(
+        forces, 
+        -coords.grad.clone().detach(), 
+        atol=1e-2 if dtype is torch.float32 else 1e-5
+    )
 
-    assert torch.allclose(ene_ref, ene, atol=1e-5), 'Energy not the same'
-
-    ene_ref.backward()
-    grads_ref = [coords.grad.clone().detach()]
-
-    coords.grad.zero_()
-
-    ene.backward()
-    grads = [coords.grad.clone().detach()]
-
-    grad_atol = 1e-5 if dtype is torch.float64 else 1e-2
-    for c, g, gref in zip(['coord', 'theta0', 'k'], grads, grads_ref):
-        assert torch.allclose(g, gref, atol=grad_atol), f'Gradient {c} not the same'
-
-    # Test time
-    Ntimes = 1000
-    start = time.time()
-    for _ in range(Ntimes):
-        ene = torchff.compute_harmonic_angle_energy(coords, angles, theta0, k)
-        ene.backward()
-    end = time.time()
-    print(f"torchff time: {(end-start)/Ntimes*1000:.5f} ms")
-
-    start = time.time()
-    for _ in range(Ntimes):
-        ene_ref = harmonic_angle(coords, angles, theta0, k)
-        ene_ref.backward()
-    end = time.time()
-    print(f"torch time: {(end-start)/Ntimes*1000:.5f} ms")
+    perf_op(
+        torchff.compute_harmonic_bond_forces, 
+        coords, angles, theta0, k, forces,
+        desc='torchff-harmonic-angle-forces', 
+        run_backward=False, use_cuda_graph=True
+    )
