@@ -1,9 +1,31 @@
 #ifndef TORCHFF_VEC3_CUH
 #define TORCHFF_VEC3_CUH
 
+// sqrt
 template <typename scalar_t> __device__ __forceinline__ scalar_t sqrt_(scalar_t x) {};
 template<> __device__ __forceinline__ float sqrt_(float x) { return ::sqrtf(x); };
 template<> __device__ __forceinline__ double sqrt_(double x) { return ::sqrt(x); };
+
+// arccos
+template <typename scalar_t> __device__ __forceinline__ scalar_t acos_(scalar_t x) {};
+template<> __device__ __forceinline__ float acos_(float x) { return ::acosf(x); };
+template<> __device__ __forceinline__ double acos_(double x) { return ::acos(x); };
+
+// cos
+template <typename scalar_t> __device__ __forceinline__ scalar_t cos_(scalar_t x) {};
+template<> __device__ __forceinline__ float cos_(float x) { return ::cos(x); };
+template<> __device__ __forceinline__ double cos_(double x) { return ::cosf(x); };
+
+// sin
+template <typename scalar_t> __device__ __forceinline__ scalar_t sin_(scalar_t x) {};
+template<> __device__ __forceinline__ float sin_(float x) { return ::sin(x); };
+template<> __device__ __forceinline__ double sin_(double x) { return ::sinf(x); };
+
+// clamp
+template <typename scalar_t> __device__ __forceinline__ scalar_t clamp_(scalar_t x, scalar_t lo, scalar_t hi) {};
+template<> __device__ __forceinline__ float clamp_(float x, float lo, float hi) { return ::fminf( ::fmaxf(x, lo), hi ); };
+template<> __device__ __forceinline__ double clamp_(double x, double lo, double hi) { return ::fmin( ::fmax(x, lo), hi ); };
+
 
 template <typename scalar_t>
 __device__ __forceinline__ void cross_vec3(scalar_t* a, scalar_t* b, scalar_t* out) {
