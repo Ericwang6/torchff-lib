@@ -74,7 +74,21 @@ setup(
             sources=[
                 'csrc/nblist/nblist_interface.cpp', 
                 'csrc/nblist/nblist_nsquared_cuda.cu', 
-                'csrc/nblist/nblist_clist_cuda.cu'
+                'csrc/nblist/nblist_clist_cuda.cu',
+                'csrc/nblist/nblist_cluster_pairs_cuda.cu'
+            ],
+            extra_compile_args={
+                'cxx': ['-O3'],
+                'nvcc': ['-O3', '-arch=sm_80']
+            },
+            include_dirs=[os.path.join(os.path.dirname(__file__), "csrc")]
+        ),
+        CUDAExtension(
+            name='torchff_nb',
+            sources=[
+                'csrc/nonbonded/nonbonded_interface.cpp',
+                'csrc/nonbonded/nonbonded_atom_pairs_cuda.cu',  
+                'csrc/nonbonded/nonbonded_cuda.cu', 
             ],
             extra_compile_args={
                 'cxx': ['-O3'],

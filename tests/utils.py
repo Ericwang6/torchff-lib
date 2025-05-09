@@ -4,19 +4,19 @@ import numpy as np
 import torch
 
 
-def check_op(func, ref_func, coords, indices, *args, check_grad=True, atol=1e-8, rtol=1e-5):
+def check_op(func, ref_func, coords, *args, check_grad=True, atol=1e-8, rtol=1e-5):
 
     args_with_grad = []
     if check_grad:
         assert coords.requires_grad, "Coordinates does not require gradient"
         for i, arg in enumerate(args):
-            if arg.requires_grad:
+            if isinstance(arg, torch.Tensor) and arg.requires_grad:
                 args_with_grad.append(i)
     
     prb_grads = []
     ref_grads = []
 
-    prb = func(coords, indices, *args)
+    prb = func(coords, *args)
     
     if check_grad:
         prb.backward()
@@ -26,7 +26,7 @@ def check_op(func, ref_func, coords, indices, *args, check_grad=True, atol=1e-8,
             prb_grads.append(args[i].grad.clone().detach().cpu())
             args[i].grad.zero_()
     
-    ref = ref_func(coords, indices, *args)
+    ref = ref_func(coords, *args)
 
     if check_grad:
         ref.backward()
@@ -36,7 +36,7 @@ def check_op(func, ref_func, coords, indices, *args, check_grad=True, atol=1e-8,
             ref_grads.append(args[i].grad.clone().detach().cpu())
             args[i].grad.zero_()
     
-    assert torch.allclose(ref, prb, atol=atol, rtol=rtol), "Energy not the same"
+    assert torch.allclose(ref, prb, atol=atol, rtol=rtol), f"Energy not the same: {ref.cpu().item():.5f} != {prb.cpu().item()}"
 
     if check_grad:
         for i, (ref_grad, prb_grad) in enumerate(zip(ref_grads, prb_grads)):
@@ -73,7 +73,8 @@ def perf_op(func, *args, desc='perf_op', warmup=10, repeat=1000, run_backward=Fa
         with torch.cuda.stream(s):
             for _ in range(warmup):
                 for arg in args:
-                    arg.grad = None
+                    if hasattr(arg, 'grad'):
+                        arg.grad = None
                 r = func(*args)
                 if run_backward:
                     r.backward()
@@ -82,7 +83,8 @@ def perf_op(func, *args, desc='perf_op', warmup=10, repeat=1000, run_backward=Fa
         if run_backward:
             g = torch.cuda.CUDAGraph()
             for arg in args:
-                arg.grad = None
+                if hasattr(arg, 'grad'):
+                    arg.grad = None
             with torch.cuda.graph(g):
                 r = func(*args)
                 r.backward()
@@ -92,7 +94,8 @@ def perf_op(func, *args, desc='perf_op', warmup=10, repeat=1000, run_backward=Fa
                 r = func(*args)
         
         for arg in args:
-            arg.grad = None
+            if hasattr(arg, 'grad'):
+                arg.grad = None
 
         for _ in range(repeat):
             start = time.perf_counter()
@@ -112,9 +115,10 @@ def perf_op(func, *args, desc='perf_op', warmup=10, repeat=1000, run_backward=Fa
 def test_perf(run_backward, use_cuda_graph, explicit_sync):
 
     def func(a):
-        return torch.sum(a ** 2)
+        # return torch.sum(a ** 2)
+        return torch.sum(torch.linalg.inv_ex(a, check_errors=False)[0])
     
-    x = torch.rand((1000, 3), device='cuda', requires_grad=run_backward)
+    x = torch.rand((3, 3), device='cuda', requires_grad=run_backward)
     perf_op(
         func,
         x,

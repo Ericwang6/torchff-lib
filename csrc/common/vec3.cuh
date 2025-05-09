@@ -26,6 +26,20 @@ template <typename scalar_t> __device__ __forceinline__ scalar_t clamp_(scalar_t
 template<> __device__ __forceinline__ float clamp_(float x, float lo, float hi) { return ::fminf( ::fmaxf(x, lo), hi ); };
 template<> __device__ __forceinline__ double clamp_(double x, double lo, double hi) { return ::fmin( ::fmax(x, lo), hi ); };
 
+// pow
+template <typename scalar_t> __device__ __forceinline__ scalar_t pow_(scalar_t x, scalar_t p) {};
+template<> __device__ __forceinline__ float pow_(float x, float p) { return ::powf(x, p); };
+template<> __device__ __forceinline__ double pow_(double x, double p) { return ::pow(x, p); };
+
+// round
+template <typename scalar_t> __device__ __forceinline__ scalar_t round_(scalar_t x) {};
+template<> __device__ __forceinline__ float round_(float x) { return ::roundf(x); };
+template<> __device__ __forceinline__ double round_(double x) { return ::round(x); };
+
+// rsqrt
+template <typename scalar_t> __device__ __forceinline__ scalar_t rsqrt_(scalar_t x) {};
+template<> __device__ __forceinline__ float rsqrt_(float x) { return ::rsqrtf(x); };
+template<> __device__ __forceinline__ double rsqrt_(double x) { return ::rsqrt(x); };
 
 template <typename scalar_t>
 __device__ __forceinline__ void cross_vec3(scalar_t* a, scalar_t* b, scalar_t* out) {
