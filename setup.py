@@ -88,7 +88,32 @@ setup(
             sources=[
                 'csrc/nonbonded/nonbonded_interface.cpp',
                 'csrc/nonbonded/nonbonded_atom_pairs_cuda.cu',  
-                'csrc/nonbonded/nonbonded_cuda.cu', 
+                'csrc/nonbonded/nonbonded_cluster_pairs_cuda.cu', 
+            ],
+            extra_compile_args={
+                'cxx': ['-O3'],
+                'nvcc': ['-O3', '-arch=sm_80']
+            },
+            include_dirs=[os.path.join(os.path.dirname(__file__), "csrc")]
+        ),
+        CUDAExtension(
+            name='torchff_multipoles',
+            sources=[
+                'csrc/multipoles/multipoles_interface.cpp',
+                'csrc/multipoles/multipoles.cu',
+            ],
+            extra_compile_args={
+                'cxx': ['-O3'],
+                'nvcc': ['-O3', '-arch=sm_80']
+            },
+            include_dirs=[os.path.join(os.path.dirname(__file__), "csrc")]
+        ),
+        CUDAExtension(
+            name='torchff_cmm',
+            sources=[
+                'csrc/cmm/cmm_interface.cpp',
+                'csrc/cmm/cmm.cu',
+                'csrc/cmm/cmm_elec.cu',
             ],
             extra_compile_args={
                 'cxx': ['-O3'],

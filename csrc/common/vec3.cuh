@@ -36,10 +36,46 @@ template <typename scalar_t> __device__ __forceinline__ scalar_t round_(scalar_t
 template<> __device__ __forceinline__ float round_(float x) { return ::roundf(x); };
 template<> __device__ __forceinline__ double round_(double x) { return ::round(x); };
 
+// floor
+template <typename scalar_t> __device__ __forceinline__ scalar_t floor_(scalar_t x) {};
+template<> __device__ __forceinline__ float floor_(float x) { return ::floorf(x); };
+template<> __device__ __forceinline__ double floor_(double x) { return ::floor(x); };
+
 // rsqrt
 template <typename scalar_t> __device__ __forceinline__ scalar_t rsqrt_(scalar_t x) {};
 template<> __device__ __forceinline__ float rsqrt_(float x) { return ::rsqrtf(x); };
 template<> __device__ __forceinline__ double rsqrt_(double x) { return ::rsqrt(x); };
+
+// abs
+template <typename scalar_t> __device__ __forceinline__ scalar_t abs_(scalar_t x) {};
+template<> __device__ __forceinline__ float abs_(float x) { return ::fabsf(x); };
+template<> __device__ __forceinline__ double abs_(double x) { return ::fabs(x); };
+
+// min
+template <typename scalar_t> __device__ __forceinline__ scalar_t min_(scalar_t x, scalar_t y) {};
+template<> __device__ __forceinline__ float min_(float x, float y) { return ::fminf( x, y ); };
+template<> __device__ __forceinline__ double min_(double x, double y) { return ::fmin( x,y ); };
+
+// max
+template <typename scalar_t> __device__ __forceinline__ scalar_t max_(scalar_t x, scalar_t y) {};
+template<> __device__ __forceinline__ float max_(float x, float y) { return ::fmaxf( x, y ); };
+template<> __device__ __forceinline__ double max_(double x, double y) { return ::fmax( x,y ); };
+
+// exp
+template <typename scalar_t> __device__ __forceinline__ scalar_t exp_(scalar_t x) {};
+template<> __device__ __forceinline__ float exp_(float x) { return ::expf( x ); };
+template<> __device__ __forceinline__ double exp_(double x) { return ::exp( x ); };
+
+// erf
+template <typename scalar_t> __device__ __forceinline__ scalar_t erf_(scalar_t x) {};
+template<> __device__ __forceinline__ float erf_(float x) { return ::erff( x ); };
+template<> __device__ __forceinline__ double erf_(double x) { return ::erf( x ); };
+
+// erfc
+template <typename scalar_t> __device__ __forceinline__ scalar_t erfc_(scalar_t x) {};
+template<> __device__ __forceinline__ float erfc_(float x) { return ::erfcf( x ); };
+template<> __device__ __forceinline__ double erfc_(double x) { return ::erfc( x ); };
+
 
 template <typename scalar_t>
 __device__ __forceinline__ void cross_vec3(scalar_t* a, scalar_t* b, scalar_t* out) {
