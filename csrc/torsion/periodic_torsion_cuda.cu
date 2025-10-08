@@ -25,81 +25,80 @@ __global__ void periodic_torsion_cuda_kernel(
     scalar_t* phase_grad,
     scalar_t sign
 ) {
-    int index = threadIdx.x + blockIdx.x * blockDim.x;
-    if (index >= ntors) {
-        return;
+    for (int index = threadIdx.x+blockIdx.x*blockDim.x; index < ntors; index += blockDim.x*gridDim.x) {
+        int offset = index * 4;
+        int32_t offset_i = 3 * torsions[offset];
+        int32_t offset_j = 3 * torsions[offset + 1];
+        int32_t offset_k = 3 * torsions[offset + 2];
+        int32_t offset_l = 3 * torsions[offset + 3];
+
+        scalar_t* coords_i = coords + offset_i;
+        scalar_t* coords_j = coords + offset_j;
+        scalar_t* coords_k = coords + offset_k;
+        scalar_t* coords_l = coords + offset_l;
+
+        scalar_t b1[3];
+        scalar_t b2[3];
+        scalar_t b3[3];
+
+        scalar_t n1[3];
+        scalar_t n2[3];
+
+        diff_vec3(coords_j, coords_i, b1);
+        diff_vec3(coords_k, coords_j, b2);
+        diff_vec3(coords_l, coords_k, b3);
+
+        cross_vec3(b1, b2, n1);
+        cross_vec3(b2, b3, n2);
+
+        scalar_t norm_n1 = norm_vec3(n1);
+        scalar_t norm_n2 = norm_vec3(n2);
+        scalar_t norm_b2 = norm_vec3(b2);
+        scalar_t norm_b2_sqr = norm_b2 * norm_b2;
+
+        scalar_t cosval = dot_vec3(n1, n2) / (norm_n1 * norm_n2);
+        cosval = clamp_(cosval, scalar_t(-0.999999999), scalar_t(0.99999999));
+
+        scalar_t k = fc[index];
+        int32_t n = per[index];
+        scalar_t phi = acos_(cosval);
+        phi = dot_vec3(n1, b3) > 0.0 ? phi : -phi;
+        phi = n * phi - phase[index];
+        
+        scalar_t tmp1 = 1 + cos_(phi);
+        scalar_t tmp2 = k * sin_(phi);
+
+        if ( ene ) {
+            ene[index] = k * tmp1;
+        }
+        
+        if (coord_grad) {
+            scalar_t prefactor = tmp2 * n * sign;
+
+            scalar_t aux1 = dot_vec3(b1, b2) / norm_b2_sqr;
+            scalar_t aux2 = dot_vec3(b2, b3) / norm_b2_sqr;
+
+            scalar_t cgi, cgj, cgk, cgl;
+            #pragma unroll 3
+            for (int i = 0; i < 3; i++) {
+                cgi = prefactor * norm_b2 / (norm_n1 * norm_n1) * n1[i];
+                cgl = -prefactor * norm_b2 / (norm_n2 * norm_n2) * n2[i];
+                cgj = (-aux1 - 1) * cgi + aux2 * cgl;
+                cgk = -cgi - cgj - cgl;
+                atomicAdd(&coord_grad[offset_i + i], cgi);
+                atomicAdd(&coord_grad[offset_j + i], cgj);
+                atomicAdd(&coord_grad[offset_l + i], cgl);
+                atomicAdd(&coord_grad[offset_k + i], cgk);
+            }
+        }
+
+        if ( fc_grad ) {
+            fc_grad[index] = tmp1;
+        }
+        if ( phase_grad ) {
+            phase_grad[index] = tmp2;
+        }   
     }
-    int offset = index * 4;
-    int32_t offset_i = 3 * torsions[offset];
-    int32_t offset_j = 3 * torsions[offset + 1];
-    int32_t offset_k = 3 * torsions[offset + 2];
-    int32_t offset_l = 3 * torsions[offset + 3];
-
-    scalar_t* coords_i = coords + offset_i;
-    scalar_t* coords_j = coords + offset_j;
-    scalar_t* coords_k = coords + offset_k;
-    scalar_t* coords_l = coords + offset_l;
-
-    scalar_t b1[3];
-    scalar_t b2[3];
-    scalar_t b3[3];
-
-    scalar_t n1[3];
-    scalar_t n2[3];
-
-    diff_vec3(coords_j, coords_i, b1);
-    diff_vec3(coords_k, coords_j, b2);
-    diff_vec3(coords_l, coords_k, b3);
-
-    cross_vec3(b1, b2, n1);
-    cross_vec3(b2, b3, n2);
-
-    scalar_t norm_n1 = norm_vec3(n1);
-    scalar_t norm_n2 = norm_vec3(n2);
-    scalar_t norm_b2 = norm_vec3(b2);
-    scalar_t norm_b2_sqr = norm_b2 * norm_b2;
-
-    scalar_t cosval = dot_vec3(n1, n2) / (norm_n1 * norm_n2);
-    cosval = clamp_(cosval, scalar_t(-0.999999999), scalar_t(0.99999999));
-
-    scalar_t k = fc[index];
-    int32_t n = per[index];
-    scalar_t phi = acos_(cosval);
-    phi = dot_vec3(n1, b3) > 0.0 ? phi : -phi;
-    phi = n * phi - phase[index];
-    
-    scalar_t tmp1 = 1 + cos_(phi);
-    scalar_t tmp2 = k * sin_(phi);
-
-    if ( ene ) {
-        ene[index] = k * tmp1;
-    }
-    
-    scalar_t prefactor = tmp2 * n * sign;
-
-    scalar_t aux1 = dot_vec3(b1, b2) / norm_b2_sqr;
-    scalar_t aux2 = dot_vec3(b2, b3) / norm_b2_sqr;
-
-    scalar_t cgi, cgj, cgk, cgl;
-    
-    #pragma unroll
-    for (int i = 0; i < 3; i++) {
-        cgi = prefactor * norm_b2 / (norm_n1 * norm_n1) * n1[i];
-        cgl = -prefactor * norm_b2 / (norm_n2 * norm_n2) * n2[i];
-        cgj = (-aux1 - 1) * cgi + aux2 * cgl;
-        cgk = -cgi - cgj - cgl;
-        atomicAdd(&coord_grad[offset_i + i], cgi);
-        atomicAdd(&coord_grad[offset_j + i], cgj);
-        atomicAdd(&coord_grad[offset_l + i], cgl);
-        atomicAdd(&coord_grad[offset_k + i], cgk);
-    }
-    
-    if ( fc_grad ) {
-        fc_grad[index] = tmp1;
-    }
-    if ( phase_grad ) {
-        phase_grad[index] = tmp2;
-    }   
 }
 
 
@@ -116,15 +115,21 @@ public:
     )
     {
         int32_t ntors = torsions.size(0);
-        int32_t block_dim = 512;
-        int32_t grid_dim = (ntors + block_dim - 1) / block_dim;
+
+        auto props = at::cuda::getCurrentDeviceProperties();
+        auto stream = at::cuda::getCurrentCUDAStream();
+        
+        int32_t block_dim = 256;
+        int32_t grid_dim = std::min(
+            (ntors + block_dim - 1) / block_dim,
+            props->multiProcessorCount*props->maxBlocksPerMultiProcessor
+        );
 
         at::Tensor ene = at::zeros({ntors}, coords.options());
         at::Tensor coord_grad = at::zeros_like(coords, coords.options());
         at::Tensor fc_grad = at::zeros_like(fc, fc.options());
         at::Tensor phase_grad = at::zeros_like(phase, phase.options());
 
-        auto stream = at::cuda::getCurrentCUDAStream();
         AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "compute_periodic_torsion_cuda", ([&] {
             periodic_torsion_cuda_kernel<scalar_t><<<grid_dim, block_dim, 0, stream>>>(
                 coords.data_ptr<scalar_t>(),
@@ -134,9 +139,9 @@ public:
                 phase.data_ptr<scalar_t>(),
                 ntors,
                 ene.data_ptr<scalar_t>(),
-                coord_grad.data_ptr<scalar_t>(),
-                fc_grad.data_ptr<scalar_t>(),
-                phase_grad.data_ptr<scalar_t>(),
+                (coords.requires_grad()) ? coord_grad.data_ptr<scalar_t>() : nullptr,
+                (fc.requires_grad()) ? fc_grad.data_ptr<scalar_t>() : nullptr,
+                (phase.requires_grad()) ? phase_grad.data_ptr<scalar_t>(): nullptr,
                 static_cast<scalar_t>(1.0)
             );
         }));
@@ -178,9 +183,14 @@ void compute_periodic_torsion_forces_cuda(
 ) {
 
     int32_t ntors = torsions.size(0);
-    int32_t block_dim = 512;
-    int32_t grid_dim = (ntors + block_dim - 1) / block_dim;
+    auto props = at::cuda::getCurrentDeviceProperties();
     auto stream = at::cuda::getCurrentCUDAStream();
+    
+    int32_t block_dim = 256;
+    int32_t grid_dim = std::min(
+        (ntors + block_dim - 1) / block_dim,
+        props->multiProcessorCount*props->maxBlocksPerMultiProcessor
+    );
     AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "compute_periodic_torsion_cuda", ([&] {
         periodic_torsion_cuda_kernel<scalar_t><<<grid_dim, block_dim, 0, stream>>>(
             coords.data_ptr<scalar_t>(),
