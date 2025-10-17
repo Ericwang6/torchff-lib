@@ -23,6 +23,28 @@ TORCH_LIBRARY_FRAGMENT(torchff, m) {
       "Scalar rcut_sr, Scalar rcut_lr, Scalar rcut_switch_buf"
     ") -> (Tensor, Tensor, Tensor)"
   );
+  m.def(
+    "cmm_field_dependent_morse_bond("
+      "Tensor coords, Tensor bonds, "
+      "Tensor req_0, Tensor kb_0, Tensor D, "
+      "Tensor dipole_deriv_1, Tensor dipole_deriv_2, "
+      "Tensor efield"
+    ") -> Tensor"
+  );
+  m.def(
+    "cmm_bond_charge_flux("
+      "Tensor coords, Tensor bonds, Tensor req, "
+      "Tensor j_cf, Tensor j_cf_pauli "
+    ") -> (Tensor, Tensor)"
+  );
+  m.def(
+    "cmm_angles("
+      "Tensor coords, Tensor angles, "
+      "Tensor theta_0, Tensor k_theta, Tensor r_eq_1, Tensor r_eq_2, "
+      "Tensor k_bb, Tensor k_ba_1, Tensor k_ba_2, "
+      "Tensor j_cf_bb, Tensor j_cf_angle, Scalar ene_coupling_min"
+    ") -> (Tensor, Tensor)"
+  );
 }
 
 PYBIND11_MODULE(torchff_cmm, m) {
