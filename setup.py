@@ -1,10 +1,28 @@
-import os
+import os, glob
 from setuptools import setup, find_packages
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 if 'CXX' not in os.environ:
     os.environ['CXX'] = 'g++'
     print("Set C++ compiler: g++")
+
+
+def build_cuda_extension(name, exclude_files=list()):
+    sources = []
+    for file in glob.glob(os.path.join(os.path.dirname(__file__), f"csrc/{name}/*")):
+        if file.endswith('.cpp') or file.endswith('.cu') or file.endswith('.c') or file.endswith('.C') and os.path.basename(file) not in exclude_files:
+            sources.append(file)
+    
+    return CUDAExtension(
+        name=f'torchff_{name}',
+        sources=sources,
+        extra_compile_args={
+            'cxx': ['-O3'],
+            'nvcc': ['-O3', '-arch=sm_80']
+        },
+        include_dirs=[os.path.join(os.path.dirname(__file__), "csrc")]
+    )
+
 
 setup(
     name='torchff',
@@ -16,111 +34,14 @@ setup(
     ],
     packages=find_packages(exclude=['csrc', 'tests', 'docs']),
     ext_modules=[
-        CUDAExtension(
-            name='torchff_harmonic_bond',
-            sources=[
-                'csrc/bond/harmonic_bond_interface.cpp',
-                'csrc/bond/harmonic_bond_cpu.cpp',
-                'csrc/bond/harmonic_bond_cuda.cu'
-            ],
-            extra_compile_args={
-                'cxx': ['-O3'],
-                'nvcc': ['-O3', '-arch=sm_80']
-            },
-            include_dirs=[os.path.join(os.path.dirname(__file__), "csrc")]
-        ),
-        CUDAExtension(
-            name='torchff_harmonic_angle',
-            sources=[
-                'csrc/angle/harmonic_angle_interface.cpp',
-                'csrc/angle/harmonic_angle_cpu.cpp',
-                'csrc/angle/harmonic_angle_cuda.cu'
-            ],
-            extra_compile_args={
-                'cxx': ['-O3'],
-                'nvcc': ['-O3', '-arch=sm_80']
-            },
-            include_dirs=[os.path.join(os.path.dirname(__file__), "csrc")]
-        ),
-        CUDAExtension(
-            name='torchff_coulomb',
-            sources=['csrc/coulomb/coulomb_interface.cpp', 'csrc/coulomb/coulomb_cuda.cu'],
-            extra_compile_args={
-                'cxx': ['-O3'],
-                'nvcc': ['-O3', '-arch=sm_80']
-            },
-            include_dirs=[os.path.join(os.path.dirname(__file__), "csrc")]
-        ),
-        CUDAExtension(
-              name='torchff_periodic_torsion',
-              sources=['csrc/torsion/periodic_torsion_interface.cpp', 'csrc/torsion/periodic_torsion_cuda.cu'],
-              extra_compile_args={
-                  'cxx': ['-O3'],
-                  'nvcc': ['-O3', '-arch=sm_80']
-              },
-              include_dirs=[os.path.join(os.path.dirname(__file__), "csrc")]
-          ),
-        CUDAExtension(
-            name='torchff_vdw',
-            sources=['csrc/vdw/lennard_jones_interface.cpp', 'csrc/vdw/lennard_jones_cuda.cu'],
-            extra_compile_args={
-                'cxx': ['-O3'],
-                'nvcc': ['-O3', '-arch=sm_80']
-            },
-            include_dirs=[os.path.join(os.path.dirname(__file__), "csrc")]
-        ),
-        CUDAExtension(
-            name='torchff_nblist',
-            sources=[
-                'csrc/nblist/nblist_interface.cpp', 
-                'csrc/nblist/nblist_nsquared_cuda.cu', 
-                'csrc/nblist/nblist_clist_cuda.cu',
-                'csrc/nblist/nblist_cluster_pairs_cuda.cu'
-            ],
-            extra_compile_args={
-                'cxx': ['-O3'],
-                'nvcc': ['-O3', '-arch=sm_80']
-            },
-            include_dirs=[os.path.join(os.path.dirname(__file__), "csrc")]
-        ),
-        CUDAExtension(
-            name='torchff_nb',
-            sources=[
-                'csrc/nonbonded/nonbonded_interface.cpp',
-                'csrc/nonbonded/nonbonded_atom_pairs_cuda.cu',  
-                'csrc/nonbonded/nonbonded_cluster_pairs_cuda.cu', 
-            ],
-            extra_compile_args={
-                'cxx': ['-O3'],
-                'nvcc': ['-O3', '-arch=sm_80']
-            },
-            include_dirs=[os.path.join(os.path.dirname(__file__), "csrc")]
-        ),
-        CUDAExtension(
-            name='torchff_multipoles',
-            sources=[
-                'csrc/multipoles/multipoles_interface.cpp',
-                'csrc/multipoles/multipoles.cu',
-            ],
-            extra_compile_args={
-                'cxx': ['-O3'],
-                'nvcc': ['-O3', '-arch=sm_80']
-            },
-            include_dirs=[os.path.join(os.path.dirname(__file__), "csrc")]
-        ),
-        CUDAExtension(
-            name='torchff_cmm',
-            sources=[
-                'csrc/cmm/cmm_interface.cpp',
-                'csrc/cmm/cmm.cu',
-                'csrc/cmm/cmm_elec.cu',
-            ],
-            extra_compile_args={
-                'cxx': ['-O3'],
-                'nvcc': ['-O3', '-arch=sm_80']
-            },
-            include_dirs=[os.path.join(os.path.dirname(__file__), "csrc")]
-        )
+        build_cuda_extension('bond'),
+        build_cuda_extension('angle'),
+        build_cuda_extension('torsion'),
+        build_cuda_extension('vdw'),
+        build_cuda_extension('coulomb'),
+        build_cuda_extension('multipoles'),
+        build_cuda_extension('ewald'),
+        build_cuda_extension('cmm')
     ],
     cmdclass={
         'build_ext': BuildExtension
