@@ -1,5 +1,7 @@
 #include <pybind11/pybind11.h>
 #include <torch/library.h>
+#include <torch/extension.h>
+
 
 TORCH_LIBRARY_FRAGMENT(torchff, m) {
   m.def(
@@ -47,6 +49,6 @@ TORCH_LIBRARY_FRAGMENT(torchff, m) {
   );
 }
 
-PYBIND11_MODULE(torchff_cmm, m) {
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "torchff CMM CUDA extension";
 }

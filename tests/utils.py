@@ -1,47 +1,37 @@
+from typing import Callable, Dict, Any
 import time
 import pytest
 import numpy as np
 import torch
 
 
-def check_op(func, ref_func, coords, *args, check_grad=True, atol=1e-8, rtol=1e-5):
-
-    args_with_grad = []
-    if check_grad:
-        assert coords.requires_grad, "Coordinates does not require gradient"
-        for i, arg in enumerate(args):
-            if isinstance(arg, torch.Tensor) and arg.requires_grad:
-                args_with_grad.append(i)
-    
-    prb_grads = []
-    ref_grads = []
-
-    prb = func(coords, *args)
-    
+def check_op(
+    func: Callable, ref_func: Callable, args: Dict[str, Any], 
+    check_grad: bool = True, atol: float = 1e-8, rtol: float = 1e-5
+):
+    prb = func(**args)
+    prb_grads = {}
     if check_grad:
         prb.backward()
-        prb_grads.append(coords.grad.clone().detach().cpu())
-        coords.grad.zero_()
-        for i in args_with_grad:
-            prb_grads.append(args[i].grad.clone().detach().cpu())
-            args[i].grad.zero_()
+        for k, v in args.items():
+            if torch.is_tensor(v) and v.grad is not None:
+                prb_grads[k] = v
+                v.grad.zero_()
     
-    ref = ref_func(coords, *args)
-
+    ref = ref_func(**args)
+    ref_grads = {}
     if check_grad:
         ref.backward()
-        ref_grads.append(coords.grad.clone().detach().cpu())
-        coords.grad.zero_()
-        for i in args_with_grad:
-            ref_grads.append(args[i].grad.clone().detach().cpu())
-            args[i].grad.zero_()
+        for k, v in args.items():
+            if torch.is_tensor(v) and v.grad is not None:
+                ref_grads[k] = v
+                v.grad.zero_()
     
-    assert torch.allclose(ref, prb, atol=atol, rtol=rtol), f"Energy not the same: {ref.cpu().item():.5f} != {prb.cpu().item()}"
-
+    assert torch.allclose(ref, prb, atol=atol, rtol=rtol), f"Function value not the same: {ref.cpu().item():.5f} != {prb.cpu().item()}"
     if check_grad:
-        for i, (ref_grad, prb_grad) in enumerate(zip(ref_grads, prb_grads)):
-            label = 'Coords ' if i == 0 else f'Argument {args_with_grad[i-1]} '
-            assert torch.allclose(ref_grad, prb_grad, atol=atol, rtol=rtol), label + f'gradient not the same, max deviation {torch.max(torch.abs(ref_grad - prb_grad))}'
+        for arg_name in prb_grads:
+            ref_grad, prb_grad = ref_grads[arg_name], prb_grads[arg_name]
+            assert torch.allclose(ref_grad, prb_grad, atol=atol, rtol=rtol), arg_name + f'gradient not the same, max deviation {torch.max(torch.abs(ref_grad - prb_grad))}, Ref: {ref_grad}, Prb: {prb_grad}'
 
 
 def perf_op(func, *args, desc='perf_op', warmup=10, repeat=1000, run_backward=False, use_cuda_graph=False, explicit_sync=True):
@@ -106,7 +96,7 @@ def perf_op(func, *args, desc='perf_op', warmup=10, repeat=1000, run_backward=Fa
             perf.append(end-start)
     
     perf = np.array(perf) * 1000  # in ms
-    print(f"{desc} - Time: {np.mean(perf):.4f}+/-{np.std(perf):.4f} ms (use_cuda_graph = {use_cuda_graph}, run_backward = {run_backward}, explicit_sync = {explicit_sync})")
+    print(f"{desc} - Time: {np.mean(perf):.4f} +/- {np.std(perf):.4f} ms (use_cuda_graph = {use_cuda_graph}, run_backward = {run_backward}, explicit_sync = {explicit_sync})")
 
 
 @pytest.mark.parametrize("run_backward", [True, False])
