@@ -1,6 +1,8 @@
 #ifndef TORCHFF_VEC3_CUH
 #define TORCHFF_VEC3_CUH
 
+#include <cuda_runtime.h>
+
 // sqrt
 template <typename scalar_t> __device__ __forceinline__ scalar_t sqrt_(scalar_t x) {};
 template<> __device__ __forceinline__ float sqrt_(float x) { return ::sqrtf(x); };
@@ -76,6 +78,16 @@ template <typename scalar_t> __device__ __forceinline__ scalar_t erfc_(scalar_t 
 template<> __device__ __forceinline__ float erfc_(float x) { return ::erfcf( x ); };
 template<> __device__ __forceinline__ double erfc_(double x) { return ::erfc( x ); };
 
+// norm3d
+template <typename scalar_t> __device__ __forceinline__ scalar_t norm3d_(scalar_t a, scalar_t b, scalar_t c) {};
+template<> __device__ __forceinline__ float norm3d_(float a, float b, float c) { return norm3df(a, b, c); };
+template<> __device__ __forceinline__ double norm3d_(double a, double b, double c) { return norm3d(a, b, c); };
+
+// rnorm3d
+template <typename scalar_t> __device__ __forceinline__ scalar_t rnorm3d_(scalar_t a, scalar_t b, scalar_t c) {};
+template<> __device__ __forceinline__ float rnorm3d_(float a, float b, float c) { return rnorm3df(a, b, c); };
+template<> __device__ __forceinline__ double rnorm3d_(double a, double b, double c) { return rnorm3d(a, b, c); };
+
 
 template <typename scalar_t>
 __device__ __forceinline__ void cross_vec3(scalar_t* a, scalar_t* b, scalar_t* out) {
@@ -98,7 +110,15 @@ __device__ __forceinline__ scalar_t dot_vec3(scalar_t* a, scalar_t* b) {
 
 template <typename scalar_t>
 __device__ __forceinline__ scalar_t norm_vec3(scalar_t* a) {
-    return sqrt_(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+    return norm3d_(a[0], a[1], a[2]);
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ scalar_t normalize_vec3(scalar_t* a, scalar_t* out) {
+    scalar_t rnorm = rnorm3d_(a[0], a[1], a[2]);
+    out[0] = a[0] * rnorm;
+    out[1] = a[1] * rnorm;
+    out[2] = a[2] * rnorm;
 }
 
 template <typename scalar_t>
