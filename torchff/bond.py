@@ -1,5 +1,5 @@
 import torch
-import torchff_harmonic_bond
+import torchff_bond
 
 
 def compute_harmonic_bond_energy(coords: torch.Tensor, bonds: torch.Tensor, b0: torch.Tensor, k: torch.Tensor) -> torch.Tensor :

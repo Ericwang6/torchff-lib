@@ -1,5 +1,5 @@
 import torch
-import torchff_harmonic_angle
+import torchff_angle
 
 
 def compute_harmonic_angle_energy(coords: torch.Tensor, angles: torch.Tensor, theta0: torch.Tensor, k: torch.Tensor) -> torch.Tensor:

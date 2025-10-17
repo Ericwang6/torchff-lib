@@ -1,5 +1,5 @@
 import torch
-import torchff_periodic_torsion
+import torchff_torsion
 
 
 def compute_periodic_torsion_energy(
