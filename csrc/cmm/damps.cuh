@@ -84,6 +84,7 @@ __device__ void polarization_damps(scalar_t r, scalar_t b, scalar_t* damps) {
     constexpr scalar_t c2_99 = scalar_t(2.0/99.0);
     constexpr scalar_t c9_143_m = scalar_t(-9.0/143.0);
     constexpr scalar_t c8_65_m = scalar_t(-8.0/65.0);
+    constexpr scalar_t c2_297 = scalar_t(2.0/297.0);
     constexpr scalar_t c101_297 = scalar_t(101.0/297.0);
     constexpr scalar_t c43_2145 = scalar_t(43.0/2145.0);
     constexpr scalar_t c10_117_m = scalar_t(-10.0/117.0);
@@ -95,7 +96,7 @@ __device__ void polarization_damps(scalar_t r, scalar_t b, scalar_t* damps) {
     damps[0] = expu * p;
     p = 1 + u;
     damps[1] = expu * ( p + u2 * c2_99 + u2*u * c9_143_m + u4 * c8_65_m + u4*u * c1_15);
-    damps[2] = expu * ( p + u2 * c101_297 + u2*u * c43_2145 + u4 * c10_117_m + u4*u * c1_45 + u4*u2 * c1_192 );
+    damps[2] = expu * ( p + u2 * c101_297 + u2*u * c2_297 + u4 * c43_2145 + u4*u * c10_117_m + u4*u2 * c1_45);
 }
 
 #endif

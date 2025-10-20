@@ -4,7 +4,7 @@
 #include "vec3.cuh"
 
 template <typename scalar_t>
-__device__ void apply_pbc_triclinic(scalar_t* vec, scalar_t* box, scalar_t* box_inv, scalar_t* out) {
+__device__ __forceinline__ void apply_pbc_triclinic(scalar_t* vec, scalar_t* box, scalar_t* box_inv, scalar_t* out) {
     // box in row major
     scalar_t sa = vec[0] * box_inv[0] + vec[1] * box_inv[3] + vec[2] * box_inv[6];
     scalar_t sb = vec[0] * box_inv[1] + vec[1] * box_inv[4] + vec[2] * box_inv[7];
@@ -19,7 +19,7 @@ __device__ void apply_pbc_triclinic(scalar_t* vec, scalar_t* box, scalar_t* box_
 
 
 template <typename scalar_t>
-__device__ void apply_pbc_orthorhombic(scalar_t* vec, scalar_t* box, scalar_t* out) {
+__device__ __forceinline__ void apply_pbc_orthorhombic(scalar_t* vec, scalar_t* box, scalar_t* out) {
     out[0] = vec[0] - round_(vec[0] / box[0]) * box[0];
     out[1] = vec[1] - round_(vec[1] / box[1]) * box[1];
     out[2] = vec[2] - round_(vec[2] / box[2]) * box[2];
@@ -27,7 +27,7 @@ __device__ void apply_pbc_orthorhombic(scalar_t* vec, scalar_t* box, scalar_t* o
 
 
 template <typename scalar_t>
-__device__ void apply_pbc_cubic(scalar_t* vec, scalar_t box, scalar_t* out) {
+__device__ __forceinline__ void apply_pbc_cubic(scalar_t* vec, scalar_t box, scalar_t* out) {
     out[0] = vec[0] - round_(vec[0] / box) * box;
     out[1] = vec[1] - round_(vec[1] / box) * box;
     out[2] = vec[2] - round_(vec[2] / box) * box;
