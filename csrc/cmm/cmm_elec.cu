@@ -142,7 +142,7 @@ __global__ void cmm_elec_from_pairs_forward_kernel(
 
         if ( dr < rcut_lr ) {
             // Ewald-real space
-            ewald_erfc_damps(dr, ewald_alpha, damps);
+            ewald_erfc_damps<scalar_t, 11>(dr, ewald_alpha, damps);
             pairwise_multipole_kernel_with_grad(
                 mi[0], mi[1], mi[2], mi[3], mi[4], mi[5], mi[6], mi[7], mi[8], mi[9],
                 mj[0], mj[1], mj[2], mj[3], mj[4], mj[5], mj[6], mj[7], mj[8], mj[9],
@@ -205,7 +205,7 @@ __global__ void cmm_elec_from_pairs_forward_kernel(
         scalar_t drz = dist_vecs_excl[index*3+2];
         scalar_t dr = sqrt_(drx*drx+dry*dry+drz*drz);
 
-        ewald_erfc_damps(dr, ewald_alpha, damps);
+        ewald_erfc_damps<scalar_t, 11>(dr, ewald_alpha, damps);
         pairwise_multipole_kernel_with_grad(
             mi[0], mi[1], mi[2], mi[3], mi[4], mi[5], mi[6], mi[7], mi[8], mi[9],
             mj[0], mj[1], mj[2], mj[3], mj[4], mj[5], mj[6], mj[7], mj[8], mj[9],
@@ -468,7 +468,7 @@ __global__ void cmm_elec_from_pairs_backward_kernel(
         
         if ( dr < rcut_lr ) {
             // Ewald-real space
-            ewald_erfc_damps(dr, ewald_alpha, damps);
+            ewald_erfc_damps<scalar_t, 11>(dr, ewald_alpha, damps);
             pairwise_multipole_kernel_with_grad(
                 mi[0], mi[1], mi[2], mi[3], mi[4], mi[5], mi[6], mi[7], mi[8], mi[9],
                 mj[0], mj[1], mj[2], mj[3], mj[4], mj[5], mj[6], mj[7], mj[8], mj[9],
@@ -556,7 +556,7 @@ __global__ void cmm_elec_from_pairs_backward_kernel(
         scalar_t efield_y_grad_j = efield_grad[j*3+1];
         scalar_t efield_z_grad_j = efield_grad[j*3+2];
 
-        ewald_erfc_damps(dr, ewald_alpha, damps);
+        ewald_erfc_damps<scalar_t, 11>(dr, ewald_alpha, damps);
         pairwise_multipole_kernel_with_grad(
             mi[0], mi[1], mi[2], mi[3], mi[4], mi[5], mi[6], mi[7], mi[8], mi[9],
             mj[0], mj[1], mj[2], mj[3], mj[4], mj[5], mj[6], mj[7], mj[8], mj[9],

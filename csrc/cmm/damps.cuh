@@ -70,7 +70,7 @@ __device__ void two_center_damps(scalar_t r, scalar_t b, scalar_t* damps) {
 }
 
 
-template <typename scalar_t>
+template <typename scalar_t, int ORDER>
 __device__ void polarization_damps(scalar_t r, scalar_t b, scalar_t* damps) {
     scalar_t u = b * r;
     scalar_t u2 = u * u;
@@ -89,7 +89,6 @@ __device__ void polarization_damps(scalar_t r, scalar_t b, scalar_t* damps) {
     constexpr scalar_t c43_2145 = scalar_t(43.0/2145.0);
     constexpr scalar_t c10_117_m = scalar_t(-10.0/117.0);
     constexpr scalar_t c1_45 = scalar_t(1.0/45.0);
-    constexpr scalar_t c1_192 = scalar_t(1.0/192.0);
 
     scalar_t p;
     p = 1 + u * c1_9 + u2 * c1_11 + u2*u * c1_13 + u4 * c1_15; 
@@ -97,6 +96,17 @@ __device__ void polarization_damps(scalar_t r, scalar_t b, scalar_t* damps) {
     p = 1 + u;
     damps[1] = expu * ( p + u2 * c2_99 + u2*u * c9_143_m + u4 * c8_65_m + u4*u * c1_15);
     damps[2] = expu * ( p + u2 * c101_297 + u2*u * c2_297 + u4 * c43_2145 + u4*u * c10_117_m + u4*u2 * c1_45);
+
+    if constexpr ( ORDER >= 7 ) {
+        constexpr scalar_t c40_99 = scalar_t(40.0/99.0);
+        constexpr scalar_t c7_99 = scalar_t(7.0/99.0);
+        constexpr scalar_t c517_96525 = scalar_t(517.0/96525.0);
+        constexpr scalar_t c43_10725 = scalar_t(43.0/10725.0);
+        constexpr scalar_t c7_325_m = scalar_t(-7.0/325.0);
+        constexpr scalar_t c1_225 = scalar_t(1.0/225.0);
+        damps[3] = expu * ( p + u2 * c40_99 + u2*u * c7_99 + u4 * c517_96525 + u4*u * c43_10725 + u4*u2 * c7_325_m + u4*u2*u * c1_225);
+    }
+    
 }
 
 #endif

@@ -54,6 +54,13 @@ TORCH_LIBRARY_FRAGMENT(torchff, m) {
       "Tensor (a!) vec_out"
     ") -> ()"
   );
+  m.def(
+    "cmm_polarization_energy_from_induced_multipoles("
+      "Tensor dist_vecs, Tensor pairs, Tensor dist_vecs_excl, Tensor pairs_excl, "
+      "Tensor induced_multipoles, Tensor b_elec_ij, "
+      "Scalar ewald_alpha, Scalar rcut_sr, Scalar rcut_lr, Scalar natoms "
+    ") -> Tensor"
+  );
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
