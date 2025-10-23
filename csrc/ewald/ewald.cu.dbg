@@ -1,0 +1,956 @@
+#include <torch/extension.h>
+#include <torch/autograd.h>
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
+#include <cublas_v2.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <math_constants.h>
+#include <vector>
+#include <torch/library.h>
+#include <cstdio>  // DEBUG ADD: for printf
+
+#ifndef C10_CUDA_KERNEL_LAUNCH_CHECK
+#define C10_CUDA_KERNEL_LAUNCH_CHECK()
+#endif
+
+#define INV_ROOT_PI 0.5641895835477563  // 1/sqrt(pi)
+
+// ========================= DEBUG CONTROLS =========================
+// Toggle all debug prints (device + host)
+#ifndef EWALD_DBG
+#define EWALD_DBG 0   // 1 = enable; 0 = disable
+#endif
+#ifndef DBG_KMAX
+#define DBG_KMAX 6    // print k = 0..DBG_KMAX-1
+#endif
+#ifndef DBG_NIDX
+#define DBG_NIDX 1    // atom index to trace in accumulation kernel
+#endif
+#define DBG_PRINT_S(k) ((k) < DBG_KMAX)
+#define DBG_PRINT_N(n) ((n) == DBG_NIDX)
+// =================================================================
+
+// ============================================================================
+// small host helper
+// ============================================================================
+inline double det3x3_host_rowmajor(const double m[9]) {
+  return m[0]*(m[4]*m[8]-m[5]*m[7]) - m[1]*(m[3]*m[8]-m[5]*m[6]) + m[2]*(m[3]*m[7]-m[4]*m[6]);
+}
+
+// ============================================================================
+// kernels
+// ============================================================================
+
+template <typename T>
+__device__ __forceinline__ void reciprocal_box_dev(const T* box, T* recip, T V) {
+  const T b1x=box[0], b1y=box[3], b1z=box[6];
+  const T b2x=box[1], b2y=box[4], b2z=box[7];
+  const T b3x=box[2], b3y=box[5], b3z=box[8];
+  const T invV = T(1)/V;
+
+  const T c23x = b2y*b3z - b2z*b3y;
+  const T c23y = b2z*b3x - b2x*b3z;
+  const T c23z = b2x*b3y - b2y*b3x;
+
+  const T c31x = b3y*b1z - b3z*b1y;
+  const T c31y = b3z*b1x - b3x*b1z;
+  const T c31z = b3x*b1y - b3y*b1x;
+
+  const T c12x = b1y*b2z - b1z*b2y;
+  const T c12y = b1z*b2x - b1x*b2z;
+  const T c12z = b1x*b2y - b1y*b2x;
+
+  recip[0]=c23x*invV; recip[3]=c31x*invV; recip[6]=c12x*invV;
+  recip[1]=c23y*invV; recip[4]=c31y*invV; recip[7]=c12y*invV;
+  recip[2]=c23z*invV; recip[5]=c31z*invV; recip[8]=c12z*invV;
+}
+
+template <typename T>
+__global__ void reciprocal_box_kernel(const T* box, T* recip, T V) {
+  if (blockIdx.x==0 && threadIdx.x==0) reciprocal_box_dev<T>(box, recip, V);
+}
+
+// Generate HKL grid (3 x M1), exclude origin
+template <typename T>
+__global__ void make_hkl_kernel(int K, T* __restrict__ hkl, size_t ld) {
+  const int R = 2*K + 1;
+  const size_t M  = (size_t)(K+1)*R*R;  // include origin
+  const size_t i0 = (size_t)K*R + K;    // origin index when h=0 plane
+
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= M || idx == i0) return;
+
+  const int lIdx =  idx            % R;
+  const int kIdx = (idx / R)       % R;
+  const int hIdx =  idx / (R*R);
+
+  const int h  = hIdx;       // h >= 0
+  const int kk = kIdx - K;
+  const int kl = lIdx - K;
+  if (h==0 && kk==0 && kl==0) return;
+
+  const size_t j = (idx < i0) ? idx : (idx - 1);  // 0..M1-1
+//column major
+//  hkl[0 + j*ld] = (T)h;
+//  hkl[1 + j*ld] = (T)kk;
+//  hkl[2 + j*ld] = (T)kl;
+//row major
+  hkl[0*ld + j] = (T)h;
+  hkl[1*ld + j] = (T)kk;
+  hkl[2*ld + j] = (T)kl;
+
+}
+
+// per-k row ops: k^2, exp(-pi^2 k^2 / alpha^2)/k^2, symmetry factor (2 for h>0)
+template <typename T>
+__global__ void krow_ops_kernel(
+    size_t M1, T alpha,
+    const T* __restrict__ kvec, int ld_kvec,  // (3, M1)
+    const T* __restrict__ hkl,  int ld_hkl,   // (3, M1)
+    T* __restrict__ k2, T* __restrict__ gaussian, T* __restrict__ sym) {
+
+  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i>=M1) return;
+//col major
+//  const T kx = kvec[0 + i*ld_kvec];
+//  const T ky = kvec[1 + i*ld_kvec];
+//  const T kz = kvec[2 + i*ld_kvec];
+//row major
+  const T kx = kvec[0*ld_kvec + i];
+  const T ky = kvec[1*ld_kvec + i];
+  const T kz = kvec[2*ld_kvec + i];
+  const T k2v = kx*kx + ky*ky + kz*kz;
+  k2[i] = k2v;
+
+  const T num = -(CUDART_PI * CUDART_PI * k2v) / (alpha*alpha);
+  gaussian[i] = exp(num) / k2v;
+
+//  const int hi = (int)llrint((double)hkl[0 + i*ld_hkl]); // row 0 is h
+  const int hi = (int)llrint((double)hkl[0*ld_hkl + i]); // row 0 is h
+  sym[i] = (hi > 0) ? T(2) : T(1);
+}
+
+// cos/sin (2pi*k.r)
+template <typename T>
+__global__ void sin_cos_kernel(
+    int M, int N,
+    const T* __restrict__ k_dot_r, int ldk,
+    T* __restrict__ cos_kr,
+    T* __restrict__ sin_kr) {
+  int k = blockIdx.x;
+  int n = blockIdx.y * blockDim.x + threadIdx.x;
+  if (k>=M || n>=N) return;
+// col major  
+//  const T x = T(2) * T(CUDART_PI) * k_dot_r[k + n*ldk];
+//  cos_kr[k + n*ldk] = cos(x);
+//  sin_kr[k + n*ldk] = sin(x);
+//row major
+  const T x = T(2) * T(CUDART_PI) * k_dot_r[k*ldk + n];
+  cos_kr[k*ldk + n] = cos(x);
+  sin_kr[k*ldk + n] = sin(x);
+
+#if EWALD_DBG
+  if (k==0 && n==0) {
+    printf("[PHASE] ldk=%d  cos(0,0)=% .8e  sin(0,0)=% .8e\n",
+           ldk, (double)cos_kr[0], (double)sin_kr[0]);
+  }
+#endif
+}
+
+// Build structure factors S(k) = sum_n (F_r + i F_i) e^{i θ}
+template <typename T>
+__global__ void structure_factor_kernel(
+    int64_t ldk_kr, int64_t N,
+    const T* __restrict__ kvec, int ld_kvec,   // (3,M1), ld_kvec = M1
+    const T* __restrict__ q,                   // (N)
+    const T* __restrict__ p,                   // (N,3)
+    const T* __restrict__ t,                   // (N,9) row-major
+    const T* __restrict__ coskr, int ldk_kr1,              // (M1,N)
+    const T* __restrict__ sinkr, int ldk_kr2,               // (M1,N)
+    int rank,
+    T* __restrict__ Sreal,                     // (M1)
+    T* __restrict__ Simag) {                   // (M1)
+
+  const int k = blockIdx.x;
+  if (k >= ld_kvec) return;
+
+  // row-major access: kvec shape (3, M1), leading dim = M1
+  const T kx = kvec[0*ld_kvec + k];
+  const T ky = kvec[1*ld_kvec + k];
+  const T kz = kvec[2*ld_kvec + k];
+
+  const T twopi = T(2)*T(CUDART_PI);
+  const T twopi2o3 = (twopi*twopi)/T(3);
+
+  T acc_r = T(0), acc_i = T(0);
+
+  for (int64_t n = threadIdx.x; n < N; n += blockDim.x) {
+    const T c = coskr[k*ldk_kr1 + n];
+    const T s = sinkr[k*ldk_kr2 + n];
+
+    // F_real
+    T F_r = q[n];
+    if (rank >= 2) {
+      const T* tn = &t[n*9];
+      const T tkx = tn[0]*kx + tn[1]*ky + tn[2]*kz;
+      const T tky = tn[3]*kx + tn[4]*ky + tn[5]*kz;
+      const T tkz = tn[6]*kx + tn[7]*ky + tn[8]*kz;
+      const T ktk = kx*tkx + ky*tky + kz*tkz;
+      F_r -= twopi2o3 * ktk;
+    }
+
+    // F_imag
+    T F_i = T(0);
+    if (rank >= 1) {
+      const T px = p[3*n + 0], py = p[3*n + 1], pz = p[3*n + 2];
+      F_i = twopi * (kx*px + ky*py + kz*pz);
+    }
+
+    // (F_r + i F_i) e^{+i θ}
+    const T real_add = F_r*c - F_i*s;
+    const T imag_add = F_r*s + F_i*c;
+
+#if EWALD_DBG
+    if (k < DBG_KMAX && N <= 8) {
+      printf("[SF.DBG] k=%d tid=%d n=%lld  c=% .8e s=% .8e  Fr=% .8e Fi=% .8e  +re=% .8e +im=% .8e  k=(% .8e,% .8e,% .8e)\n",
+             k, (int)threadIdx.x, (long long)n,
+             (double)c, (double)s, (double)F_r, (double)F_i,
+             (double)real_add, (double)imag_add,
+             (double)kx, (double)ky, (double)kz);
+    }
+#endif
+
+    acc_r += real_add;
+    acc_i += imag_add;
+  }
+
+  __shared__ T s_r[256], s_i[256];
+  const int tid = threadIdx.x;
+  s_r[tid] = acc_r; s_i[tid] = acc_i;
+  __syncthreads();
+  for (int stride = blockDim.x>>1; stride>0; stride>>=1) {
+    if (tid < stride) { s_r[tid]+=s_r[tid+stride]; s_i[tid]+=s_i[tid+stride]; }
+    __syncthreads();
+  }
+  if (tid==0) {
+    Sreal[k] = s_r[0];
+    Simag[k] = s_i[0];
+#if EWALD_DBG
+    if (DBG_PRINT_S(k)) {
+      printf("[SF] k=%d  Sr=% .8e  Si=% .8e\n", k, (double)Sreal[k], (double)Simag[k]);
+    }
+#endif
+  }
+}
+
+
+// Accumulate per-atom potential, field, grad, curvature
+// Since to calculate forces I am using F = q*E + (d*field_gradient) + (t* field_gradient_gradient)/3
+template <typename T>
+__global__ void accumulate_atoms_kernel(
+    int64_t M1, int64_t N,
+    const T* __restrict__ kvec, int ld_kvec,      // (3,M1), ld_kvec = M1
+    const T* __restrict__ coskr, int ldk_kr1,    // (M1,N)
+    const T* __restrict__ sinkr, int ldk_kr2,    // (M1,N)
+    const T* __restrict__ gaussian,  // (M1)
+    const T* __restrict__ sym,       // (M1)
+    const T* __restrict__ Sreal,     // (M1)
+    const T* __restrict__ Simag,     // (M1)
+    T V,
+    int with_field, int with_grad, int with_curv,
+    T* __restrict__ pot,             // (N)
+    T* __restrict__ field,           // (N,3)
+    T* __restrict__ grad,            // (N,9)
+    T* __restrict__ curv)            // (N,27)
+{
+  const int n = blockIdx.x * blockDim.x + threadIdx.x;
+  if (n >= N) return;
+
+  const T invV     = T(1) / V;
+  const T pref_pot = invV / T(CUDART_PI);                         // 1/(piV)
+  const T pref_fld = -T(2) * invV;                                // -2/V
+  const T pref_grd = T(4) * T(CUDART_PI) * invV;                  // 4pi/V
+  const T pref_crv = T(8) * T(CUDART_PI) * T(CUDART_PI) * invV;   // 8pi^2/V
+
+  T acc_p = T(0);
+  T acc_fx=T(0), acc_fy=T(0), acc_fz=T(0);
+  T g00=0,g01=0,g02=0, g10=0,g11=0,g12=0, g20=0,g21=0,g22=0;
+
+  // curvature accumulators (flatten i*9 + j*3 + k), fastest k
+  T c[27];
+  #pragma unroll 27
+  for (int i=0;i<27;++i) c[i]=T(0);
+
+  for (int64_t k = 0; k < M1; ++k) {
+    const T ckr  = coskr[k*ldk_kr1 + n];
+    const T skr  = sinkr[k*ldk_kr2 + n];
+    const T Sr   = Sreal[k];
+    const T Si   = Simag[k];
+    const T w    = gaussian[k] * sym[k];
+
+    // Re[S e^{-iθ}] and Im[S e^{-iθ}] (match Python)
+    const T realp = Sr*ckr + Si*skr;     // potential term
+    const T imagp = -Sr*skr + Si*ckr;    // field term == (Si*ckr - Sr*skr)
+
+    // potential
+    acc_p += w * realp;
+
+    // k components
+    // col major
+    //const T kx = kvec[0 + k*3], ky = kvec[1 + k*3], kz = kvec[2 + k*3];
+    //row major
+    const T kx = kvec[0*ld_kvec + k];
+    const T ky = kvec[1*ld_kvec + k];
+    const T kz = kvec[2*ld_kvec + k];
+    // field
+    if (with_field) {
+      acc_fx += w * imagp * kx;
+      acc_fy += w * imagp * ky;
+      acc_fz += w * imagp * kz;
+    }
+    // field grad
+    if (with_grad) {
+      const T rr = w * realp;
+      g00 += rr*kx*kx; g01 += rr*kx*ky; g02 += rr*kx*kz;
+      g10 += rr*ky*kx; g11 += rr*ky*ky; g12 += rr*ky*kz;
+      g20 += rr*kz*kx; g21 += rr*kz*ky; g22 += rr*kz*kz;
+    }
+    // field grad grad
+    if (with_curv) {
+      const T ii =  w * imagp; // -Im(...) * k⊗k⊗k
+      // i=0 row
+      c[ 0]+=ii*kx*kx*kx; c[ 1]+=ii*kx*kx*ky; c[ 2]+=ii*kx*kx*kz;
+      c[ 3]+=ii*kx*ky*kx; c[ 4]+=ii*kx*ky*ky; c[ 5]+=ii*kx*ky*kz;
+      c[ 6]+=ii*kx*kz*kx; c[ 7]+=ii*kx*kz*ky; c[ 8]+=ii*kx*kz*kz;
+      // i=1 row
+      c[ 9]+=ii*ky*kx*kx; c[10]+=ii*ky*kx*ky; c[11]+=ii*ky*kx*kz;
+      c[12]+=ii*ky*ky*kx; c[13]+=ii*ky*ky*ky; c[14]+=ii*ky*ky*kz;
+      c[15]+=ii*ky*kz*kx; c[16]+=ii*ky*kz*ky; c[17]+=ii*ky*kz*kz;
+      // i=2 row
+      c[18]+=ii*kz*kx*kx; c[19]+=ii*kz*kx*ky; c[20]+=ii*kz*kx*kz;
+      c[21]+=ii*kz*ky*kx; c[22]+=ii*kz*ky*ky; c[23]+=ii*kz*ky*kz;
+      c[24]+=ii*kz*kz*kx; c[25]+=ii*kz*kz*ky; c[26]+=ii*kz*kz*kz;
+    }
+
+#if EWALD_DBG
+    if (DBG_PRINT_N(n) && DBG_PRINT_S(k)) {
+      printf("[ACC] n=%d k=%d  Sr=% .8e Si=% .8e  c=% .8e s=% .8e  re=% .8e im=% .8e  g=% .8e sym=%g  k=(% .8e,% .8e,% .8e)\n",
+             n, (int)k,
+             (double)Sr, (double)Si, (double)ckr, (double)skr,
+             (double)realp, (double)imagp, (double)w, (double)sym[k],
+             (double)kx, (double)ky, (double)kz);
+    }
+#endif
+  }
+
+#if EWALD_DBG
+  if (DBG_PRINT_N(n)) {
+    printf("[ACC] n=%d totals (pre-prefactor): pot_sum=% .12e  Fx=% .12e  Fy=% .12e  Fz=% .12e\n",
+           n, (double)acc_p, (double)acc_fx, (double)acc_fy, (double)acc_fz);
+  }
+#endif
+
+  // Final scalings (match Python)
+  pot[n] += pref_pot * acc_p;
+
+  if (with_field) {
+    field[3*n+0] += pref_fld * acc_fx;
+    field[3*n+1] += pref_fld * acc_fy;
+    field[3*n+2] += pref_fld * acc_fz;
+  }
+  if (with_grad) {
+    T* G = &grad[9*n];
+    G[0]+=pref_grd*g00; G[1]+=pref_grd*g01; G[2]+=pref_grd*g02;
+    G[3]+=pref_grd*g10; G[4]+=pref_grd*g11; G[5]+=pref_grd*g12;
+    G[6]+=pref_grd*g20; G[7]+=pref_grd*g21; G[8]+=pref_grd*g22;
+  }
+  if (with_curv) {
+    T* C = &curv[27*n];
+    #pragma unroll
+    for (int i=0;i<27;++i) C[i] += pref_crv * c[i];
+  }
+}
+
+// Energy & forces (full multipolar; uses E, ∇E, ∇∇E)
+template <typename T>
+__global__ void energy_and_forces_kernel(
+    int64_t N, int rank,
+    const T* __restrict__ q,        // (N)
+    const T* __restrict__ p,        // (N,3) or nullptr if rank<1
+    const T* __restrict__ t,        // (N,9) or nullptr if rank<2
+    const T* __restrict__ pot,      // (N)
+    const T* __restrict__ field,    // (N,3)
+    const T* __restrict__ grad,     // (N,9)
+    const T* __restrict__ curv,     // (N,27) or nullptr if not computed
+    T*       __restrict__ energy,   // scalar (size 1), init 0
+    T*       __restrict__ forces    // (N,3), init 0
+){
+  const int n = blockIdx.x * blockDim.x + threadIdx.x;
+  T e_local = T(0);
+
+  if (n < N) {
+    const T qn   = q[n];
+    const T potn = pot[n];
+
+    const T Ex = field[3*n + 0];
+    const T Ey = field[3*n + 1];
+    const T Ez = field[3*n + 2];
+
+    // energy
+    T field_ene = T(0);
+    if (rank >= 1 && p) {
+      const T px = p[3*n + 0], py = p[3*n + 1], pz = p[3*n + 2];
+      field_ene = px*Ex + py*Ey + pz*Ez; // p · E
+    }
+
+    T grad_ene = T(0);
+    if (rank >= 2 && t && grad) {
+      const T* tn = &t[9*n];
+      const T* gn = &grad[9*n]; // row-major
+      grad_ene =
+        tn[0]*gn[0] + tn[1]*gn[1] + tn[2]*gn[2] +
+        tn[3]*gn[3] + tn[4]*gn[4] + tn[5]*gn[5] +
+        tn[6]*gn[6] + tn[7]*gn[7] + tn[8]*gn[8];
+    }
+
+    e_local = T(0.5) * ( qn*potn - field_ene - grad_ene / T(3) );
+
+    // forces
+    T Fx = qn * Ex;
+    T Fy = qn * Ey;
+    T Fz = qn * Ez;
+
+    if (rank >= 1 && p && grad) {
+      const T px = p[3*n + 0], py = p[3*n + 1], pz = p[3*n + 2];
+      const T* g = &grad[9*n]; // ∇E
+      // (∇E)^T p
+      Fx += (g[0]*px + g[3]*py + g[6]*pz);
+      Fy += (g[1]*px + g[4]*py + g[7]*pz);
+      Fz += (g[2]*px + g[5]*py + g[8]*pz);
+    }
+
+    if (rank >= 2 && t && curv) {
+      const T* C  = &curv[27*n]; // C[i,j,k], i-slowest, k-fastest in our packing above
+      const T* Tn = &t[9*n];
+      // add (1/3) * C : T to each component
+      auto add_quad = [&](int i, T &Fi){
+        const T* Ci = C + 9*i;
+        Fi += (Ci[0]*Tn[0] + Ci[1]*Tn[1] + Ci[2]*Tn[2] +
+               Ci[3]*Tn[3] + Ci[4]*Tn[4] + Ci[5]*Tn[5] +
+               Ci[6]*Tn[6] + Ci[7]*Tn[7] + Ci[8]*Tn[8]) / T(3);
+      };
+      add_quad(0, Fx); add_quad(1, Fy); add_quad(2, Fz);
+    }
+
+    forces[3*n+0] += Fx;
+    forces[3*n+1] += Fy;
+    forces[3*n+2] += Fz;
+  }
+
+  // block reduction of energy
+  __shared__ T ssum[256];
+  const int tid = threadIdx.x;
+  ssum[tid] = e_local;
+  __syncthreads();
+
+  for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (tid < stride) ssum[tid] += ssum[tid + stride];
+    __syncthreads();
+  }
+  if (tid == 0) {
+    atomicAdd(energy, ssum[0]); // ok for double on CC>=6
+  }
+}
+
+
+// ============================================================================
+// ============================================================================
+
+std::vector<at::Tensor> ewald_prepare_intermediates_cuda(
+    const at::Tensor& coords, const at::Tensor& box, int64_t K, double alpha) {
+  TORCH_CHECK(coords.is_cuda() && box.is_cuda(), "coords & box must be CUDA");
+  TORCH_CHECK(coords.scalar_type()==at::kDouble && box.scalar_type()==at::kDouble, "use float64");
+  TORCH_CHECK(coords.dim()==2 && coords.size(1)==3, "coords must be (N,3)");
+  TORCH_CHECK(box.sizes()==at::IntArrayRef({3,3}), "box must be (3,3)");
+
+  at::cuda::CUDAGuard guard(coords.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto handle = at::cuda::getCurrentCUDABlasHandle();
+
+  const int64_t N = coords.size(0);
+  auto opts = coords.options();
+
+  // Volume on host (sync anyway due to .item)
+  double h_box[9];
+  {
+    auto box_c = box.contiguous().cpu();
+    auto* b = box_c.data_ptr<double>();
+    for (int r=0;r<3;++r) for (int c=0;c<3;++c) h_box[r*3+c] = b[r*3+c];
+  }
+  const double V = det3x3_host_rowmajor(h_box);
+
+  // Reciprocal box on device
+  auto recip = at::empty({3,3}, opts);
+  reciprocal_box_kernel<double><<<1,1,0,stream>>>(
+      box.data_ptr<double>(), recip.data_ptr<double>(), V);
+
+  // HKL (3 x M1)
+  const int R  = 2*int(K) + 1;
+  const int64_t M  = (int64_t)(K+1) * R * R;
+  const int64_t M1 = M - 1;
+  auto hkl = at::empty({3, M1}, opts);
+  {
+    dim3 block(256), grid((unsigned)((M + block.x - 1)/block.x));
+    make_hkl_kernel<double><<<grid, block, 0, stream>>>(int(K), hkl.data_ptr<double>(), (size_t)M1);
+  }
+
+  // kvec = recip @ hkl  (3x3)*(3xM1) = (3xM1)
+  auto kvec = at::matmul(recip, hkl).contiguous();
+  std::cout << "[DBG] kvec sizes " << kvec.sizes()
+          << " strides " << kvec.strides() << "\n";
+// Expect sizes: (3, M1)  strides: (M1, 1)
+
+//  auto kvec = at::empty({3, M1}, opts);
+//  {
+//    const double one = 1.0, zero = 0.0;
+//    TORCH_CUDABLAS_CHECK(cublasDgemm(
+//      handle, CUBLAS_OP_N, CUBLAS_OP_N,
+//      3, (int)M1, 3,
+//      &one,
+//      recip.data_ptr<double>(), 3,
+//      hkl.data_ptr<double>(),   3,
+//      &zero,
+//      kvec.data_ptr<double>(),  3));
+//  }
+
+  // k2, gaussian, sym
+  auto k2    = at::empty({M1}, opts);
+  auto gauss = at::empty({M1}, opts);
+  auto sym   = at::empty({M1}, opts);
+  {
+    dim3 block(256), grid((unsigned)((M1 + block.x - 1)/block.x));
+    krow_ops_kernel<double><<<grid, block, 0, stream>>>(
+        (size_t)M1, (double)alpha, kvec.data_ptr<double>(), (int)M1,
+        hkl.data_ptr<double>(), (int)M1,
+        k2.data_ptr<double>(), gauss.data_ptr<double>(), sym.data_ptr<double>());
+  }
+
+  // k·r = (kvec^T) * coords^T  -> (M1 x N)
+  auto kdotr = at::matmul(kvec.transpose(0,1), coords.transpose(0,1)).contiguous();
+//  auto kdotr = at::empty({M1, N}, opts);
+//  {
+//    const double one = 1.0, zero = 0.0;
+//    TORCH_CUDABLAS_CHECK(cublasDgemm(
+//      handle, CUBLAS_OP_T, CUBLAS_OP_T,
+//      (int)M1, (int)N, 3,
+//      &one,
+//      kvec.data_ptr<double>(), 3,     // (3 x M1)^T
+//      coords.data_ptr<double>(), (int)N,   // (N x 3)^T
+//      &zero,
+//      kdotr.data_ptr<double>(), (int)M1));
+//  }
+
+  // cos/sin(2pi*k*r)
+  auto coskr = at::empty_like(kdotr);
+  auto sinkr = at::empty_like(kdotr);
+  const int ldk = (int)kdotr.stride(0);
+  {
+    dim3 block(256,1,1);
+    dim3 grid((int)M1, (int)((N + block.x - 1)/block.x), 1);
+    sin_cos_kernel<double><<<grid, block, 0, stream>>>(
+        (int)M1, (int)N, kdotr.data_ptr<double>(), ldk,
+        coskr.data_ptr<double>(), sinkr.data_ptr<double>());
+  }
+
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {recip, hkl, kvec, k2, gauss, sym, kdotr, coskr, sinkr};
+}
+
+// Finish: potential, field, grad, curvature (+ self terms)
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+ewald_long_range_cuda(
+    const at::Tensor& coords, const at::Tensor& box,
+    const at::Tensor& q, const at::Tensor& p, const at::Tensor& t,
+    const at::Tensor& kvec, const at::Tensor& gaussian, const at::Tensor& sym,
+    const at::Tensor& coskr, const at::Tensor& sinkr,
+    int rank, double alpha) {
+
+  TORCH_CHECK(coords.is_cuda() && q.is_cuda() && kvec.is_cuda(), "CUDA tensors expected");
+  TORCH_CHECK(coords.scalar_type()==at::kDouble, "double tensors expected");
+
+  at::cuda::CUDAGuard guard(coords.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+#if EWALD_DBG
+  std::cout << "[CUDA] q is_contig=" << q.is_contiguous() << " sizes " << q.sizes() << "\n";
+  if (rank>=1) std::cout << "[CUDA] p contig=" << p.is_contiguous() << " sizes " << p.sizes() << " strides " << p.strides() << "\n";
+  if (rank>=2) std::cout << "[CUDA] t contig=" << t.is_contiguous() << " sizes " << t.sizes() << " strides " << t.strides() << "\n";
+#endif
+
+
+  const int64_t N  = coords.size(0);
+  const int64_t M1 = gaussian.size(0);
+  std::cout << "Number of k-vectors (M1): " << M1 << std::endl;
+
+  // Volume
+  const double V = at::det(box).item<double>();
+  std::cout << std::setprecision(10)
+          << "Volume V = " << V
+          << "   1/(πV)=" << (1.0 / (CUDART_PI * V))
+          << "   -2/V="   << (-2.0 / V) << "\n";
+
+#if EWALD_DBG
+  std::cout << std::setprecision(10)
+            << "[CUDA] sum(sym) = " << sym.sum().item<double>() << "\n";
+  for (int k = 0; k < std::min<int64_t>(DBG_KMAX, M1); ++k) {
+    auto kx = kvec.index({0,k}).item<double>();
+    auto ky = kvec.index({1,k}).item<double>();
+    auto kz = kvec.index({2,k}).item<double>();
+    auto g  = gaussian[k].item<double>();
+    auto s  = sym[k].item<double>();
+    std::cout << "[CUDA] k["<<k<<"] = ("<<kx<<","<<ky<<","<<kz<<")  g="<<g<<"  sym="<<s<<"\n";
+  }
+  {
+    const int dbg_n = std::min<int64_t>(DBG_NIDX, N-1);
+    std::cout << "--- cos/sin for n="<<dbg_n<<" (first " << std::min<int64_t>(DBG_KMAX, M1) << " k) ---\n";
+    for (int k = 0; k < std::min<int64_t>(DBG_KMAX, M1); ++k) {
+      double c = coskr.index({k, dbg_n}).item<double>();
+      double s = sinkr.index({k, dbg_n}).item<double>();
+      std::cout << "k="<<k<<"  cos="<<c<<"  sin="<<s<<"\n";
+    }
+  }
+#endif
+#if EWALD_DBG
+  {
+    std::cout << "[CUDA] rank=" << rank << "  N=" << N << "  M1=" << M1 << "\n";
+    const int nshow = (int)std::min<int64_t>(3, N);
+    std::cout << "[CUDA] q[0.."<<(nshow-1)<<"]:";
+    for (int n=0;n<nshow;++n) std::cout << " " << q[n].item<double>();
+    std::cout << "\n";
+    if (rank >= 1 && p.defined() && p.numel() >= 3*nshow) {
+      for (int n=0;n<nshow;++n) {
+	std::cout << "[CUDA] p["<<n<<"] = ("
+		  << p[n][0].item<double>() << ", "
+		  << p[n][1].item<double>() << ", "
+		  << p[n][2].item<double>() << ")\n";
+      }
+    }
+    if (rank >= 2 && t.defined() && t.numel() >= 9*nshow) {
+      for (int n=0;n<nshow;++n) {
+	auto tn = t[n];
+	std::cout << "[CUDA] t["<<n<<"] row-major 3x3:\n";
+	std::cout << "   " << tn[0][0].item<double>() << " " << tn[0][1].item<double>() << " " << tn[0][2].item<double>() << "\n";
+	std::cout << "   " << tn[1][0].item<double>() << " " << tn[1][1].item<double>() << " " << tn[1][2].item<double>() << "\n";
+	std::cout << "   " << tn[2][0].item<double>() << " " << tn[2][1].item<double>() << " " << tn[2][2].item<double>() << "\n";
+      }
+    }
+  }
+#endif
+
+  // S(k)
+  auto Sreal = at::zeros({M1}, coords.options());
+  auto Simag = at::zeros({M1}, coords.options());
+  const int ldk_kr = (int)coskr.stride(0);
+  {
+    dim3 grid((unsigned)M1), block(256);
+    structure_factor_kernel<double><<<grid, block, 0, stream>>>(
+      M1, N,
+      kvec.data_ptr<double>(), (int)M1,
+      q.data_ptr<double>(),
+      p.data_ptr<double>(),
+      t.reshape({N,9}).data_ptr<double>(),
+      coskr.data_ptr<double>(), ldk_kr,
+      sinkr.data_ptr<double>(), ldk_kr,
+      rank,
+      Sreal.data_ptr<double>(),
+      Simag.data_ptr<double>());
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+#if EWALD_DBG
+  std::cout << "--- S(k) (first " << std::min<int64_t>(DBG_KMAX,M1) << ") ---\n";
+  for (int k = 0; k < std::min<int64_t>(DBG_KMAX, M1); ++k) {
+    std::cout << "[CUDA] S["<<k<<"] = ("
+              << Sreal[k].item<double>() << ", "
+              << Simag[k].item<double>() << ")\n";
+  }
+#endif
+
+  // per-atom accum
+  auto potential = at::zeros({N}, coords.options());
+  auto field     = at::zeros({N,3}, coords.options());
+  auto fieldgrad = at::zeros({N,3,3}, coords.options());
+  auto curvature = at::zeros({N,3,3,3}, coords.options());
+
+  {
+    const int with_field = 1;
+    const int with_grad  = (rank >= 1);
+    const int with_curv  = (rank >= 2);
+    const int ldk_kr = (int)coskr.stride(0);
+    dim3 block(256), grid((unsigned)((N + block.x - 1)/block.x));
+    accumulate_atoms_kernel<double><<<grid, block, 0, stream>>>(
+      M1, N,
+      kvec.data_ptr<double>(), (int)M1,
+      coskr.data_ptr<double>(), ldk_kr,
+      sinkr.data_ptr<double>(), ldk_kr,
+      gaussian.data_ptr<double>(),
+      sym.data_ptr<double>(),
+      Sreal.data_ptr<double>(),
+      Simag.data_ptr<double>(),
+      (double)V,
+      with_field, with_grad, with_curv,
+      potential.data_ptr<double>(),
+      field.data_ptr<double>(),
+      fieldgrad.reshape({N,9}).data_ptr<double>(),
+      curvature.reshape({N,27}).data_ptr<double>());
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  // self terms
+  const double a_over_rpi = alpha * INV_ROOT_PI;
+  potential.add_(q, -2.0 * a_over_rpi);
+  if (rank >= 1) field.add_(p, a_over_rpi * (4.0*alpha*alpha/3.0));
+  if (rank >= 2) fieldgrad.add_(t, a_over_rpi * (16.0*alpha*alpha*alpha*alpha/15.0));
+
+#if EWALD_DBG
+  std::cout << std::setprecision(12)
+          << "CUDA potential[0..2]: "
+          << potential[0].item<double>() << " "
+          << potential[1].item<double>() << " "
+          << potential[2].item<double>() << "\n";
+  if (rank >= 1 && N >= 2) {
+    std::cout << "CUDA field[1]: ("
+              << field[1][0].item<double>() << ", "
+              << field[1][1].item<double>() << ", "
+              << field[1][2].item<double>() << ")\n";
+  }
+#endif
+
+  return {potential, field, fieldgrad, curvature};
+}
+
+// Energy & Forces wrapper
+std::tuple<at::Tensor, at::Tensor>
+ewald_energy_and_forces_cuda(
+    const at::Tensor& q, const at::Tensor& p, const at::Tensor& t,
+    const at::Tensor& potential, const at::Tensor& field,
+    const at::Tensor& grad, const at::Tensor& curv, int rank) {
+
+  TORCH_CHECK(q.is_cuda() && potential.is_cuda() && field.is_cuda(), "CUDA tensors expected");
+  TORCH_CHECK(q.scalar_type()==at::kDouble && potential.scalar_type()==at::kDouble &&
+              field.scalar_type()==at::kDouble, "double tensors expected");
+
+  at::cuda::CUDAGuard guard(q.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  const int64_t N = q.size(0);
+  auto opts = q.options();
+
+  auto energy = at::zeros({}, opts);
+  auto forces = at::zeros({N,3}, opts);
+
+  {
+    dim3 block(256), grid((unsigned)((N + block.x - 1)/block.x));
+    energy_and_forces_kernel<double><<<grid, block, 0, stream>>>(
+      N, rank,
+      q.data_ptr<double>(),
+      p.defined() ? p.data_ptr<double>() : nullptr,
+      t.defined() ? t.reshape({N,9}).data_ptr<double>() : nullptr,
+      potential.data_ptr<double>(),
+      field.data_ptr<double>(),
+      grad.defined() ? grad.reshape({N,9}).data_ptr<double>() : nullptr,
+      curv.defined() ? curv.reshape({N,27}).data_ptr<double>() : nullptr,
+      energy.data_ptr<double>(),
+      forces.data_ptr<double>());
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {energy, forces};
+}
+
+// One-shot op: returns (pot, field, grad, energy, forces)
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+ewald_long_range_all_cuda(
+    const at::Tensor& coords, const at::Tensor& box,
+    const at::Tensor& q, const at::Tensor& p, const at::Tensor& t,
+    int64_t K, int rank, double alpha) {
+
+  at::cuda::CUDAGuard guard(coords.device());
+
+  auto prep = ewald_prepare_intermediates_cuda(coords, box, K, alpha);
+  const at::Tensor& kvec  = prep[2];
+  const at::Tensor& gauss = prep[4];
+  const at::Tensor& sym   = prep[5];
+  const at::Tensor& coskr = prep[7];
+  const at::Tensor& sinkr = prep[8];
+
+  at::Tensor pot, field, grad, curv;
+  std::tie(pot, field, grad, curv) = ewald_long_range_cuda(
+      coords, box, q, p, t, kvec, gauss, sym, coskr, sinkr, rank, alpha);
+
+  at::Tensor energy, forces;
+  std::tie(energy, forces) = ewald_energy_and_forces_cuda(
+      q, p, t, pot, field, grad, curv, rank);
+
+  return {pot, field, grad, energy, forces};
+}
+
+// ============================================================================
+// Autograd wrapper: custom backward (coords only via energy)
+// ============================================================================
+struct EwaldLongRangeAllFunctionCuda
+    : public torch::autograd::Function<EwaldLongRangeAllFunctionCuda> {
+
+  static torch::autograd::variable_list forward(
+      torch::autograd::AutogradContext* ctx,
+      at::Tensor coords,
+      at::Tensor box,
+      at::Tensor q,
+      at::Tensor p,
+      at::Tensor t,
+      at::Tensor K_t,     // 0-d long tensor
+      at::Tensor rank_t,  // 0-d long tensor
+      at::Tensor alpha_t  // 0-d double tensor
+  ) {
+    const int64_t K    = K_t.item<int64_t>();
+    const int      rk  = static_cast<int>(rank_t.item<int64_t>());
+    const double   alp = alpha_t.item<double>();
+
+    // --- run your pipeline ---
+    auto prep = ewald_prepare_intermediates_cuda(coords, box, K, alp);
+    const at::Tensor& kvec  = prep[2];
+    const at::Tensor& gauss = prep[4];
+    const at::Tensor& sym   = prep[5];
+    const at::Tensor& coskr = prep[7];
+    const at::Tensor& sinkr = prep[8];
+
+    // DEBUG ADD (safe shape sanity; uses local N/M1 and correct names)
+#if EWALD_DBG
+    const int64_t N = coords.size(0);
+    const int64_t M1 = gauss.size(0);
+    TORCH_CHECK(kvec.dim()==2, "kvec must be 2D, got ", kvec.sizes());
+    TORCH_CHECK(gauss.dim()==1 && gauss.size(0)==M1, "gauss must be (M1,), got ", gauss.sizes());
+    TORCH_CHECK(sym.dim()==1 && sym.size(0)==M1, "sym must be (M1,), got ", sym.sizes());
+    TORCH_CHECK(coskr.dim()==2 && coskr.size(0)==M1 && coskr.size(1)==N, "coskr must be (M1,N), got ", coskr.sizes());
+    TORCH_CHECK(sinkr.dim()==2 && sinkr.size(0)==M1 && sinkr.size(1)==N, "sinkr must be (M1,N), got ", sinkr.sizes());
+    std::cout << "[AUTO] N="<<N<<" M1="<<M1<<" sum(sym)="<<sym.sum().item<double>()<<"\n";
+#endif
+
+    // potential/field/grad (and optionally curvature if you have it)
+    at::Tensor potential, field, grad, curv;
+    std::tie(potential, field, grad, curv) =
+        ewald_long_range_cuda(coords, box, q, p, t,
+                              kvec, gauss, sym, coskr, sinkr,
+                              rk, alp);
+
+    // energy & forces
+    at::Tensor energy, forces;
+    std::tie(energy, forces) =
+        ewald_energy_and_forces_cuda(q, p, t, potential, field, grad,curv, rk);
+
+    // save anything needed for backward (we use forces to give dL/dcoords = -gE * F)
+    ctx->save_for_backward({forces});
+
+#if EWALD_DBG
+    if (potential.numel()>=3) {
+      std::cout << "[AUTO] pot[0..2]="
+                << potential[0].item<double>() << " "
+                << potential[1].item<double>() << " "
+                << potential[2].item<double>() << "\n";
+    }
+#endif
+
+    torch::autograd::variable_list out(5);
+    out[0] = potential;
+    out[1] = field;
+    out[2] = grad;
+    out[3] = energy;
+    out[4] = forces;
+    return out;
+  }
+
+  static torch::autograd::variable_list backward(
+      torch::autograd::AutogradContext* ctx,
+      torch::autograd::variable_list grad_outputs) {
+
+    // grad_outputs: [g_potential, g_field, g_grad, g_energy, g_forces]
+    const at::Tensor& gE = grad_outputs[3]; // scalar
+
+    auto saved = ctx->get_saved_variables();
+    const at::Tensor& F = saved[0]; // (N,3)
+
+    at::Tensor dcoords;
+    if (gE.defined()) {
+      // dL/dcoords = -gE * forces
+      auto scale = (gE.dim()==0) ? gE.view({1,1}) : gE;
+      dcoords = -(scale) * F;
+      if (!dcoords.sizes().equals(F.sizes())) {
+        dcoords = dcoords.expand_as(F).contiguous();
+      }
+    } else {
+      dcoords = at::zeros_like(F);
+    }
+
+    // We passed 8 inputs to forward; return 8 grads in order.
+    torch::autograd::variable_list grads(8);
+    grads[0] = dcoords;      // d/d coords
+    grads[1] = at::Tensor(); // d/d box   (not implemented)
+    grads[2] = at::Tensor(); // d/d q     (not implemented)
+    grads[3] = at::Tensor(); // d/d p     (not implemented)
+    grads[4] = at::Tensor(); // d/d t     (not implemented)
+    grads[5] = at::Tensor(); // d/d K_t   (int scalar -> no grad)
+    grads[6] = at::Tensor(); // d/d rank_t
+    grads[7] = at::Tensor(); // d/d alpha_t
+    return grads;
+  }
+};
+
+
+
+// ============================================================================
+// Registration
+// ============================================================================
+TORCH_LIBRARY_IMPL(torchff, CUDA, m) {
+  m.impl("ewald_prepare_intermediates",
+         [](const at::Tensor& coords, const at::Tensor& box, int64_t K, double alpha) {
+           auto outs = ewald_prepare_intermediates_cuda(coords, box, K, alpha);
+           return std::make_tuple(outs[0],outs[1],outs[2],outs[3],outs[4],outs[5],outs[6],outs[7],outs[8]);
+         });
+
+  m.impl("ewald_finish_long_range",
+         [](const at::Tensor& coords, const at::Tensor& box,
+            const at::Tensor& q, const at::Tensor& p, const at::Tensor& t,
+            const at::Tensor& kvec, const at::Tensor& gaussian, const at::Tensor& sym,
+            const at::Tensor& coskr, const at::Tensor& sinkr, int64_t rank, double alpha) {
+           return ewald_long_range_cuda(coords, box, q, p, t,
+                                        kvec, gaussian, sym, coskr, sinkr,
+                                        (int)rank, alpha);
+         });
+
+  m.impl("ewald_energy_forces",
+         [](const at::Tensor& q, const at::Tensor& p, const at::Tensor& t,
+            const at::Tensor& potential, const at::Tensor& field,
+            const at::Tensor& grad, const at::Tensor& curv, int64_t rank) {
+           return ewald_energy_and_forces_cuda(q, p, t, potential, field, grad, curv, (int)rank);
+         });
+}
+
+// One-shot op with **custom autograd**.
+TORCH_LIBRARY_IMPL(torchff, AutogradCUDA, m) {
+  m.impl("ewald_long_range",
+         [](const at::Tensor& coords, const at::Tensor& box,
+            const at::Tensor& q, const at::Tensor& p, const at::Tensor& t,
+            int64_t K, int64_t rank, double alpha) {
+
+           auto K_t     = at::scalar_tensor(K,     at::TensorOptions().dtype(at::kLong));
+           auto rank_t  = at::scalar_tensor(rank,  at::TensorOptions().dtype(at::kLong));
+           auto alpha_t = at::scalar_tensor(alpha, at::TensorOptions().dtype(at::kDouble));
+
+           auto outs = EwaldLongRangeAllFunctionCuda::apply(
+               coords, box, q, p, t, K_t, rank_t, alpha_t);
+
+           return std::make_tuple(outs[0], outs[1], outs[2], outs[3], outs[4]);
+         });
+}
+
