@@ -10,12 +10,15 @@
 #include <math_constants.h>
 #include <vector>
 #include <torch/library.h>
+#include <cstdio>  // DEBUG ADD: for printf
 
 #ifndef C10_CUDA_KERNEL_LAUNCH_CHECK
 #define C10_CUDA_KERNEL_LAUNCH_CHECK()
 #endif
 
 #define INV_ROOT_PI 0.5641895835477563  // 1/sqrt(pi)
+
+// =================================================================
 
 // ============================================================================
 // small host helper
@@ -62,7 +65,6 @@ template <typename T>
 __global__ void make_hkl_kernel(int K, T* __restrict__ hkl, size_t ld) {
   const int R = 2*K + 1;
   const size_t M  = (size_t)(K+1)*R*R;  // include origin
-  //const size_t M1 = M - 1;              // exclude origin
   const size_t i0 = (size_t)K*R + K;    // origin index when h=0 plane
 
   size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -72,14 +74,16 @@ __global__ void make_hkl_kernel(int K, T* __restrict__ hkl, size_t ld) {
   const int kIdx = (idx / R)       % R;
   const int hIdx =  idx / (R*R);
 
-  const int h  = hIdx;
+  const int h  = hIdx;       // h >= 0
   const int kk = kIdx - K;
   const int kl = lIdx - K;
+  if (h==0 && kk==0 && kl==0) return;
 
   const size_t j = (idx < i0) ? idx : (idx - 1);  // 0..M1-1
-  hkl[0 + j*ld] = (T)h;
-  hkl[1 + j*ld] = (T)kk;
-  hkl[2 + j*ld] = (T)kl;
+  hkl[0*ld + j] = (T)h;
+  hkl[1*ld + j] = (T)kk;
+  hkl[2*ld + j] = (T)kl;
+
 }
 
 // per-k row ops: k^2, exp(-pi^2 k^2 / alpha^2)/k^2, symmetry factor (2 for h>0)
@@ -92,17 +96,16 @@ __global__ void krow_ops_kernel(
 
   size_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i>=M1) return;
-
-  const T kx = kvec[0 + i*ld_kvec];
-  const T ky = kvec[1 + i*ld_kvec];
-  const T kz = kvec[2 + i*ld_kvec];
+  const T kx = kvec[0*ld_kvec + i];
+  const T ky = kvec[1*ld_kvec + i];
+  const T kz = kvec[2*ld_kvec + i];
   const T k2v = kx*kx + ky*ky + kz*kz;
   k2[i] = k2v;
 
   const T num = -(CUDART_PI * CUDART_PI * k2v) / (alpha*alpha);
   gaussian[i] = exp(num) / k2v;
 
-  const int hi = (int)llrint((double)hkl[0 + i*ld_hkl]); // row 0 is h
+  const int hi = (int)llrint((double)hkl[0*ld_hkl + i]); // row 0 is h
   sym[i] = (hi > 0) ? T(2) : T(1);
 }
 
@@ -116,31 +119,33 @@ __global__ void sin_cos_kernel(
   int k = blockIdx.x;
   int n = blockIdx.y * blockDim.x + threadIdx.x;
   if (k>=M || n>=N) return;
-  const T x = T(2) * T(CUDART_PI) * k_dot_r[k + n*ldk];
-  cos_kr[k + n*ldk] = cos(x);
-  sin_kr[k + n*ldk] = sin(x);
+  const T x = T(2) * T(CUDART_PI) * k_dot_r[k*ldk + n];
+  cos_kr[k*ldk + n] = cos(x);
+  sin_kr[k*ldk + n] = sin(x);
+
 }
 
 // Build structure factors S(k) = sum_n (F_r + i F_i) e^{i θ}
 template <typename T>
 __global__ void structure_factor_kernel(
-    int64_t M1, int64_t N,
-    const T* __restrict__ kvec,   // (3,M1)
-    const T* __restrict__ q,      // (N)
-    const T* __restrict__ p,      // (N,3)
-    const T* __restrict__ t,      // (N,9) row-major
-    const T* __restrict__ coskr,  // (M1,N)
-    const T* __restrict__ sinkr,  // (M1,N)
+    int64_t ldk_kr, int64_t N,
+    const T* __restrict__ kvec, int ld_kvec,   // (3,M1), ld_kvec = M1
+    const T* __restrict__ q,                   // (N)
+    const T* __restrict__ p,                   // (N,3)
+    const T* __restrict__ t,                   // (N,9) row-major
+    const T* __restrict__ coskr, int ldk_kr1,              // (M1,N)
+    const T* __restrict__ sinkr, int ldk_kr2,               // (M1,N)
     int rank,
-    T* __restrict__ Sreal,        // (M1)
-    T* __restrict__ Simag) {      // (M1)
+    T* __restrict__ Sreal,                     // (M1)
+    T* __restrict__ Simag) {                   // (M1)
 
   const int k = blockIdx.x;
-  if (k >= M1) return;
+  if (k >= ld_kvec) return;
 
-  const T kx = kvec[0 + k*3];
-  const T ky = kvec[1 + k*3];
-  const T kz = kvec[2 + k*3];
+  // row-major access: kvec shape (3, M1), leading dim = M1
+  const T kx = kvec[0*ld_kvec + k];
+  const T ky = kvec[1*ld_kvec + k];
+  const T kz = kvec[2*ld_kvec + k];
 
   const T twopi = T(2)*T(CUDART_PI);
   const T twopi2o3 = (twopi*twopi)/T(3);
@@ -148,8 +153,8 @@ __global__ void structure_factor_kernel(
   T acc_r = T(0), acc_i = T(0);
 
   for (int64_t n = threadIdx.x; n < N; n += blockDim.x) {
-    const T c = coskr[k + n*M1];
-    const T s = sinkr[k + n*M1];
+    const T c = coskr[k*ldk_kr1 + n];
+    const T s = sinkr[k*ldk_kr2 + n];
 
     // F_real
     T F_r = q[n];
@@ -169,8 +174,13 @@ __global__ void structure_factor_kernel(
       F_i = twopi * (kx*px + ky*py + kz*pz);
     }
 
-    acc_r += F_r*c - F_i*s;
-    acc_i += F_r*s + F_i*c;
+    // (F_r + i F_i) e^{+i θ}
+    const T real_add = F_r*c - F_i*s;
+    const T imag_add = F_r*s + F_i*c;
+
+
+    acc_r += real_add;
+    acc_i += imag_add;
   }
 
   __shared__ T s_r[256], s_i[256];
@@ -181,17 +191,21 @@ __global__ void structure_factor_kernel(
     if (tid < stride) { s_r[tid]+=s_r[tid+stride]; s_i[tid]+=s_i[tid+stride]; }
     __syncthreads();
   }
-  if (tid==0) { Sreal[k] = s_r[0]; Simag[k] = s_i[0]; }
+  if (tid==0) {
+    Sreal[k] = s_r[0];
+    Simag[k] = s_i[0];
+  }
 }
+
 
 // Accumulate per-atom potential, field, grad, curvature
 // Since to calculate forces I am using F = q*E + (d*field_gradient) + (t* field_gradient_gradient)/3
 template <typename T>
 __global__ void accumulate_atoms_kernel(
     int64_t M1, int64_t N,
-    const T* __restrict__ kvec,      // (3,M1)
-    const T* __restrict__ coskr,     // (M1,N)
-    const T* __restrict__ sinkr,     // (M1,N)
+    const T* __restrict__ kvec, int ld_kvec,      // (3,M1), ld_kvec = M1
+    const T* __restrict__ coskr, int ldk_kr1,    // (M1,N)
+    const T* __restrict__ sinkr, int ldk_kr2,    // (M1,N)
     const T* __restrict__ gaussian,  // (M1)
     const T* __restrict__ sym,       // (M1)
     const T* __restrict__ Sreal,     // (M1)
@@ -207,10 +221,10 @@ __global__ void accumulate_atoms_kernel(
   if (n >= N) return;
 
   const T invV     = T(1) / V;
-  const T pref_pot = invV / T(CUDART_PI);                         // 1/(piV)   //real
-  const T pref_fld = -T(2) * invV;                                 // -2/V     //imag
-  const T pref_grd = T(4) * T(CUDART_PI) * invV;                  // 4pi/V     //real
-  const T pref_crv = T(8) * T(CUDART_PI) * T(CUDART_PI) * invV;   // 8pi^2/V   //imag
+  const T pref_pot = invV / T(CUDART_PI);                         // 1/(piV)
+  const T pref_fld = -T(2) * invV;                                // -2/V
+  const T pref_grd = T(4) * T(CUDART_PI) * invV;                  // 4pi/V
+  const T pref_crv = T(8) * T(CUDART_PI) * T(CUDART_PI) * invV;   // 8pi^2/V
 
   T acc_p = T(0);
   T acc_fx=T(0), acc_fy=T(0), acc_fz=T(0);
@@ -222,33 +236,40 @@ __global__ void accumulate_atoms_kernel(
   for (int i=0;i<27;++i) c[i]=T(0);
 
   for (int64_t k = 0; k < M1; ++k) {
-    const T ckr  = coskr[k + n*M1];
-    const T skr  = sinkr[k + n*M1];
+    const T ckr  = coskr[k*ldk_kr1 + n];
+    const T skr  = sinkr[k*ldk_kr2 + n];
     const T Sr   = Sreal[k];
     const T Si   = Simag[k];
     const T w    = gaussian[k] * sym[k];
 
-    const T realp = Sr*ckr + Si*skr;     // Re(S e^{-iθ})
-    const T imagp = -Sr*skr + Si*ckr;    // Im(S e^{-iθ})
+    // Re[S e^{-iθ}] and Im[S e^{-iθ}] (match Python)
+    const T realp = Sr*ckr + Si*skr;     // potential term
+    const T imagp = -Sr*skr + Si*ckr;    // field term == (Si*ckr - Sr*skr)
 
-    //potential
+    // potential
     acc_p += w * realp;
 
-    const T kx = kvec[0 + k*3], ky = kvec[1 + k*3], kz = kvec[2 + k*3];
-    //field
+    // k components
+    // col major
+    //const T kx = kvec[0 + k*3], ky = kvec[1 + k*3], kz = kvec[2 + k*3];
+    //row major
+    const T kx = kvec[0*ld_kvec + k];
+    const T ky = kvec[1*ld_kvec + k];
+    const T kz = kvec[2*ld_kvec + k];
+    // field
     if (with_field) {
       acc_fx += w * imagp * kx;
       acc_fy += w * imagp * ky;
       acc_fz += w * imagp * kz;
     }
-    //field grad
+    // field grad
     if (with_grad) {
       const T rr = w * realp;
       g00 += rr*kx*kx; g01 += rr*kx*ky; g02 += rr*kx*kz;
       g10 += rr*ky*kx; g11 += rr*ky*ky; g12 += rr*ky*kz;
       g20 += rr*kz*kx; g21 += rr*kz*ky; g22 += rr*kz*kz;
     }
-    //field grad grad
+    // field grad grad
     if (with_curv) {
       const T ii =  w * imagp; // -Im(...) * k⊗k⊗k
       // i=0 row
@@ -263,9 +284,10 @@ __global__ void accumulate_atoms_kernel(
       c[18]+=ii*kz*kx*kx; c[19]+=ii*kz*kx*ky; c[20]+=ii*kz*kx*kz;
       c[21]+=ii*kz*ky*kx; c[22]+=ii*kz*ky*ky; c[23]+=ii*kz*ky*kz;
       c[24]+=ii*kz*kz*kx; c[25]+=ii*kz*kz*ky; c[26]+=ii*kz*kz*kz;
+     }
     }
-  }
 
+  // Final scalings (match Python)
   pot[n] += pref_pot * acc_p;
 
   if (with_field) {
@@ -339,15 +361,15 @@ __global__ void energy_and_forces_kernel(
       const T px = p[3*n + 0], py = p[3*n + 1], pz = p[3*n + 2];
       const T* g = &grad[9*n]; // ∇E
       // (∇E)^T p
-      Fx -= (g[0]*px + g[3]*py + g[6]*pz);
-      Fy -= (g[1]*px + g[4]*py + g[7]*pz);
-      Fz -= (g[2]*px + g[5]*py + g[8]*pz);
+      Fx += (g[0]*px + g[3]*py + g[6]*pz);
+      Fy += (g[1]*px + g[4]*py + g[7]*pz);
+      Fz += (g[2]*px + g[5]*py + g[8]*pz);
     }
 
     if (rank >= 2 && t && curv) {
       const T* C  = &curv[27*n]; // C[i,j,k], i-slowest, k-fastest in our packing above
       const T* Tn = &t[9*n];
-      // add (1/3) * C : T to each component
+      // add (1/6) * C : T to each component
       auto add_quad = [&](int i, T &Fi){
         const T* Ci = C + 9*i;
         Fi += (Ci[0]*Tn[0] + Ci[1]*Tn[1] + Ci[2]*Tn[2] +
@@ -416,22 +438,25 @@ std::vector<at::Tensor> ewald_prepare_intermediates_cuda(
   auto hkl = at::empty({3, M1}, opts);
   {
     dim3 block(256), grid((unsigned)((M + block.x - 1)/block.x));
-    make_hkl_kernel<double><<<grid, block, 0, stream>>>(int(K), hkl.data_ptr<double>(), 3);
+    make_hkl_kernel<double><<<grid, block, 0, stream>>>(int(K), hkl.data_ptr<double>(), (size_t)M1);
   }
 
   // kvec = recip @ hkl  (3x3)*(3xM1) = (3xM1)
-  auto kvec = at::empty({3, M1}, opts);
-  {
-    const double one = 1.0, zero = 0.0;
-    TORCH_CUDABLAS_CHECK(cublasDgemm(
-      handle, CUBLAS_OP_N, CUBLAS_OP_N,
-      3, (int)M1, 3,
-      &one,
-      recip.data_ptr<double>(), 3,
-      hkl.data_ptr<double>(),   3,
-      &zero,
-      kvec.data_ptr<double>(),  3));
-  }
+  auto kvec = at::matmul(recip, hkl).contiguous();
+// Expect sizes: (3, M1)  strides: (M1, 1)
+
+//  auto kvec = at::empty({3, M1}, opts);
+//  {
+//    const double one = 1.0, zero = 0.0;
+//    TORCH_CUDABLAS_CHECK(cublasDgemm(
+//      handle, CUBLAS_OP_N, CUBLAS_OP_N,
+//      3, (int)M1, 3,
+//      &one,
+//      recip.data_ptr<double>(), 3,
+//      hkl.data_ptr<double>(),   3,
+//      &zero,
+//      kvec.data_ptr<double>(),  3));
+//  }
 
   // k2, gaussian, sym
   auto k2    = at::empty({M1}, opts);
@@ -440,33 +465,35 @@ std::vector<at::Tensor> ewald_prepare_intermediates_cuda(
   {
     dim3 block(256), grid((unsigned)((M1 + block.x - 1)/block.x));
     krow_ops_kernel<double><<<grid, block, 0, stream>>>(
-        (size_t)M1, (double)alpha, kvec.data_ptr<double>(), 3,
-        hkl.data_ptr<double>(), 3,
+        (size_t)M1, (double)alpha, kvec.data_ptr<double>(), (int)M1,
+        hkl.data_ptr<double>(), (int)M1,
         k2.data_ptr<double>(), gauss.data_ptr<double>(), sym.data_ptr<double>());
   }
 
   // k·r = (kvec^T) * coords^T  -> (M1 x N)
-  auto kdotr = at::empty({M1, N}, opts);
-  {
-    const double one = 1.0, zero = 0.0;
-    TORCH_CUDABLAS_CHECK(cublasDgemm(
-      handle, CUBLAS_OP_T, CUBLAS_OP_T,
-      (int)M1, (int)N, 3,
-      &one,
-      kvec.data_ptr<double>(), 3,     // (3 x M1)^T
-      coords.data_ptr<double>(), (int)N,   // (N x 3)^T
-      &zero,
-      kdotr.data_ptr<double>(), (int)M1));
-  }
+  auto kdotr = at::matmul(kvec.transpose(0,1), coords.transpose(0,1)).contiguous();
+//  auto kdotr = at::empty({M1, N}, opts);
+//  {
+//    const double one = 1.0, zero = 0.0;
+//    TORCH_CUDABLAS_CHECK(cublasDgemm(
+//      handle, CUBLAS_OP_T, CUBLAS_OP_T,
+//      (int)M1, (int)N, 3,
+//      &one,
+//      kvec.data_ptr<double>(), 3,     // (3 x M1)^T
+//      coords.data_ptr<double>(), (int)N,   // (N x 3)^T
+//      &zero,
+//      kdotr.data_ptr<double>(), (int)M1));
+//  }
 
   // cos/sin(2pi*k*r)
   auto coskr = at::empty_like(kdotr);
   auto sinkr = at::empty_like(kdotr);
+  const int ldk = (int)kdotr.stride(0);
   {
     dim3 block(256,1,1);
     dim3 grid((int)M1, (int)((N + block.x - 1)/block.x), 1);
     sin_cos_kernel<double><<<grid, block, 0, stream>>>(
-        (int)M1, (int)N, kdotr.data_ptr<double>(), (int)M1,
+        (int)M1, (int)N, kdotr.data_ptr<double>(), ldk,
         coskr.data_ptr<double>(), sinkr.data_ptr<double>());
   }
 
@@ -483,12 +510,9 @@ ewald_long_range_cuda(
     const at::Tensor& coskr, const at::Tensor& sinkr,
     int rank, double alpha) {
 
-  TORCH_CHECK(coords.is_cuda() && q.is_cuda() && kvec.is_cuda(), "CUDA tensors expected");
-  TORCH_CHECK(coords.scalar_type()==at::kDouble, "double tensors expected");
 
   at::cuda::CUDAGuard guard(coords.device());
   auto stream = at::cuda::getCurrentCUDAStream();
-
   const int64_t N  = coords.size(0);
   const int64_t M1 = gaussian.size(0);
 
@@ -498,20 +522,22 @@ ewald_long_range_cuda(
   // S(k)
   auto Sreal = at::zeros({M1}, coords.options());
   auto Simag = at::zeros({M1}, coords.options());
+  const int ldk_kr = (int)coskr.stride(0);
   {
     dim3 grid((unsigned)M1), block(256);
     structure_factor_kernel<double><<<grid, block, 0, stream>>>(
       M1, N,
-      kvec.data_ptr<double>(),
+      kvec.data_ptr<double>(), (int)M1,
       q.data_ptr<double>(),
       p.data_ptr<double>(),
       t.reshape({N,9}).data_ptr<double>(),
-      coskr.data_ptr<double>(),
-      sinkr.data_ptr<double>(),
+      coskr.data_ptr<double>(), ldk_kr,
+      sinkr.data_ptr<double>(), ldk_kr,
       rank,
       Sreal.data_ptr<double>(),
       Simag.data_ptr<double>());
   }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   // per-atom accum
   auto potential = at::zeros({N}, coords.options());
@@ -520,15 +546,16 @@ ewald_long_range_cuda(
   auto curvature = at::zeros({N,3,3,3}, coords.options());
 
   {
-    const int with_field = (rank >= 1);
+    const int with_field = 1;
     const int with_grad  = (rank >= 1);
     const int with_curv  = (rank >= 2);
+    const int ldk_kr = (int)coskr.stride(0);
     dim3 block(256), grid((unsigned)((N + block.x - 1)/block.x));
     accumulate_atoms_kernel<double><<<grid, block, 0, stream>>>(
       M1, N,
-      kvec.data_ptr<double>(),
-      coskr.data_ptr<double>(),
-      sinkr.data_ptr<double>(),
+      kvec.data_ptr<double>(), (int)M1,
+      coskr.data_ptr<double>(), ldk_kr,
+      sinkr.data_ptr<double>(), ldk_kr,
       gaussian.data_ptr<double>(),
       sym.data_ptr<double>(),
       Sreal.data_ptr<double>(),
@@ -545,8 +572,8 @@ ewald_long_range_cuda(
   // self terms
   const double a_over_rpi = alpha * INV_ROOT_PI;
   potential.add_(q, -2.0 * a_over_rpi);
-  if (rank >= 1) field.add_(p, a_over_rpi * (4.0*alpha*alpha/3.0));
-  if (rank >= 2) fieldgrad.add_(t, a_over_rpi * (16.0*alpha*alpha*alpha*alpha/15.0));
+  field.add_(p, a_over_rpi * (4.0*alpha*alpha/3.0));
+  fieldgrad.add_(t, a_over_rpi * (16.0*alpha*alpha*alpha*alpha/15.0));
 
   return {potential, field, fieldgrad, curvature};
 }
@@ -638,7 +665,6 @@ struct EwaldLongRangeAllFunctionCuda
     const double   alp = alpha_t.item<double>();
 
     // --- run your pipeline ---
-    // prep
     auto prep = ewald_prepare_intermediates_cuda(coords, box, K, alp);
     const at::Tensor& kvec  = prep[2];
     const at::Tensor& gauss = prep[4];
@@ -646,7 +672,7 @@ struct EwaldLongRangeAllFunctionCuda
     const at::Tensor& coskr = prep[7];
     const at::Tensor& sinkr = prep[8];
 
-    // potential/field/grad (and optionally curvature if you have it)
+
     at::Tensor potential, field, grad, curv;
     std::tie(potential, field, grad, curv) =
         ewald_long_range_cuda(coords, box, q, p, t,
@@ -753,5 +779,4 @@ TORCH_LIBRARY_IMPL(torchff, AutogradCUDA, m) {
            return std::make_tuple(outs[0], outs[1], outs[2], outs[3], outs[4]);
          });
 }
-
 
