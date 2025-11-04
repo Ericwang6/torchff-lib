@@ -3,7 +3,6 @@
 #include <torch/extension.h>
 
 TORCH_LIBRARY_FRAGMENT(torchff, m) {
-  // one-shot op you’ll call from Python (returns 5 outputs)
   m.def("ewald_long_range(Tensor coords, Tensor box, "
         "Tensor q, Tensor p, Tensor t, int K, int rank, float alpha) "
         "-> (Tensor, Tensor, Tensor, Tensor, Tensor)");
