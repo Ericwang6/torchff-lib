@@ -7,7 +7,6 @@ TORCH_LIBRARY_FRAGMENT(torchff, m) {
         "Tensor q, Tensor p, Tensor t, int K, int rank, float alpha) "
         "-> (Tensor, Tensor, Tensor, Tensor, Tensor)");
 }
-
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "torchff multipolar PME CUDA extension";
 }

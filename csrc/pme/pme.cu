@@ -7,7 +7,6 @@
 #include <cmath>
 #include <stdio.h> 
 #include <ATen/cuda/CUDAContext.h>
-
 #ifndef PI
 #define PI 3.14159265358979323846
 #endif
@@ -41,7 +40,6 @@ __device__ __forceinline__ void eval_b6_and_derivs(double u, double* val, double
     }
     else if (u < 3.0) {
         // Range [2, 3)
-        // Optimized: Removed pow(), used explicit multiplication
         double u_1 = u - 1.0;
         double u_1_2 = u_1 * u_1;
         double u_1_4 = u_1_2 * u_1_2;
@@ -54,8 +52,6 @@ __device__ __forceinline__ void eval_b6_and_derivs(double u, double* val, double
 
         *val = u5 * (1.0/120.0) + u_2_5 * 0.125 - u_1_5 * (1.0/20.0);
         *d1  = u4 * (1.0/24.0)  + 0.625 * u_2_4 - u_1_4 * 0.25;
-
-        // Expanded forms for d2/d3 are correct and faster than sum-of-basis here
         *d2  = (5.0/3.0)*u3 - 12.0*u2 + 27.0*u - 19.0;
         *d3  = 5.0*u2 - 24.0*u + 27.0;
     }
@@ -72,20 +68,19 @@ __device__ __forceinline__ void eval_b6_and_derivs(double u, double* val, double
 
         *val = u5*(1.0/120.0) - u_3_5*(1.0/6.0) + u_2_5*0.125 - u_1_5*(1.0/20.0);
 
-        // Expanded polys for derivatives
         *d1 = (-5.0/12.0)*u4 + 6.0*u3 - 31.5*u2 + 71.0*u - 57.75;
         *d2 = (-5.0/3.0)*u3 + 18.0*u2 - 63.0*u + 71.0;
         *d3 = -5.0*u2 + 36.0*u - 63.0;
     }
     else if (u < 5.0) {
-        // Range [4, 5) - Fully expanded polynomials (Correct)
+        // Range [4, 5)
         *val = u5*(1.0/24.0) - u4 + 9.5*u3 - 44.5*u2 + 102.25*u - 91.45;
         *d1  = (5.0/24.0)*u4 - 4.0*u3 + 28.5*u2 - 89.0*u + 102.25;
         *d2  = (5.0/6.0)*u3 - 12.0*u2 + 57.0*u - 89.0;
         *d3  = 2.5*u2 - 24.0*u + 57.0;
     }
     else if (u < 6.0) {
-        // Range [5, 6) - Fully expanded polynomials (Correct)
+        // Range [5, 6) 
         *val = -u5*(1.0/120.0) + 0.25*u4 - 3.0*u3 + 18.0*u2 - 54.0*u + 64.8;
         *d1  = -u4*(1.0/24.0) + u3 - 9.0*u2 + 36.0*u - 54.0;
         *d2  = -u3*(1.0/6.0) + 3.0*u2 - 18.0*u + 36.0;
@@ -110,7 +105,7 @@ __global__ void spread_q_kernel(
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N_atoms) return;
-
+	
     double n_star[3][3];
     #pragma unroll
     for(int i=0; i<3; i++)
@@ -133,7 +128,7 @@ __global__ void spread_q_kernel(
     }
 
     double M[3][6], dM[3][6], d2M[3][6], d3M[3][6];
-    
+    //Calculate B-Spline and derivatives
     #pragma unroll
     for(int d=0; d<3; d++) {
         #pragma unroll
@@ -142,23 +137,8 @@ __global__ void spread_q_kernel(
             eval_b6_and_derivs(u_eval, &M[d][k], &dM[d][k], &d2M[d][k], &d3M[d][k]);
         }
     }
-
-    double q_val = Q[idx * 9 + 0];
-    double px = 0.0, py = 0.0, pz = 0.0;
-    if (RANK >= 1) {
-        pz = Q[idx * 9 + 1]; px = Q[idx * 9 + 2]; py = Q[idx * 9 + 3];
-    }
-    double q20=0, q21c=0, q21s=0, q22c=0, q22s=0;
-    double div3 = 1.0/3.0;
-    double rt3 = 1.73205080757;
-    if (RANK >= 2) {
-        q20  = Q[idx * 9 + 4];
-        q21c = Q[idx * 9 + 5];
-        q21s = Q[idx * 9 + 6];
-        q22c = Q[idx * 9 + 7];
-        q22s = Q[idx * 9 + 8];
-    }
-
+    //Initialize monopoles
+    double q_val = Q[idx * 10 + 0];
     #pragma unroll 6
     for (int iz = 0; iz < 6; iz++) {
         int gz = (m_u0[2] + (iz - 3) + 1000 * K3) % K3;
@@ -184,6 +164,9 @@ __global__ void spread_q_kernel(
                 double term = q_val * theta;
 
                 if (RANK >= 1) {
+		    //initialize dipoles
+        	    double px = Q[idx * 10 + 1]; double py = Q[idx * 10 + 2]; double pz = Q[idx * 10 + 3];
+		    //initialize b-spline derivative
                     double dt_du[3];
                     dt_du[0] = dMx * My * Mz;
                     dt_du[1] = Mx * dMy * Mz;
@@ -199,11 +182,18 @@ __global__ void spread_q_kernel(
                     term -= px * dt_dr[0] + py * dt_dr[1] + pz * dt_dr[2];
 
                     if (RANK >= 2) {
+			 //initialize quadrupoles
+			 double Qxx = Q[idx * 10 + 4];
+			 double Qxy = Q[idx * 10 + 5];
+			 double Qxz = Q[idx * 10 + 6];
+			 double Qyy = Q[idx * 10 + 7];
+			 double Qyz = Q[idx * 10 + 8];
+			 double Qzz = Q[idx * 10 + 9];
+			 //initialize b-spline double primes
                          double d2t_du2[3];
                          d2t_du2[0] = d2Mx * My * Mz;
                          d2t_du2[1] = Mx * d2My * Mz;
                          d2t_du2[2] = Mx * My * d2Mz;
-
                          double d2t_du_mix[3];
                          d2t_du_mix[0] = dMx * dMy * Mz;
                          d2t_du_mix[1] = dMx * My * dMz;
@@ -232,14 +222,9 @@ __global__ void spread_q_kernel(
                              }
                          }
 
-                         double trace = H_r[0][0] + H_r[1][1] + H_r[2][2];
-			 double h_20  = (3.0 * H_r[2][2] - trace) * div3 * 0.5;
-                         double h_21c = rt3 * H_r[0][2] * div3;
-                         double h_21s = rt3 * H_r[1][2] * div3;
-                         double h_22c = (rt3 * 0.5) * (H_r[0][0] - H_r[1][1]) * div3;
-                         double h_22s = rt3 * H_r[0][1] * div3;
 
-                         double interaction = q20 * h_20 + q21c * h_21c + q21s * h_21s + q22c * h_22c + q22s * h_22s;
+			 double interaction = Qxx * Hu_vals[0][0] + Qyy * Hu_vals[1][1] + Qzz * Hu_vals[2][2] + 2*(Qxy * Hu_vals[0][1] + Qxz * Hu_vals[0][2] + Qyz * Hu_vals[1][2]);
+			 interaction *= 0.5;
                          term += interaction;
                     }
                 }
@@ -303,14 +288,14 @@ __global__ void interpolate_kernel(
     }
 
     // --- 3. Multipole Setup ---
-    double q_val = Q[idx * 9 + 0];
+    double q_val = Q[idx * 10 + 0];
 
     // Dipoles
     double p_lat[3] = {0.0};
     if (RANK >= 1) {
-        double pz = Q[idx * 9 + 1];
-        double px = Q[idx * 9 + 2];
-        double py = Q[idx * 9 + 3];
+        double px = Q[idx * 10 + 1];
+        double py = Q[idx * 10 + 2];
+        double pz = Q[idx * 10 + 3];
         #pragma unroll
         for(int i=0; i<3; i++)
             p_lat[i] = (px * n_star[i][0] + py * n_star[i][1] + pz * n_star[i][2]) * grid_K[i];
@@ -319,21 +304,13 @@ __global__ void interpolate_kernel(
     // Quadrupoles
     double Q_lat[6] = {0.0};
     if (RANK >= 2) {
-        double q20  = Q[idx * 9 + 4];
-        double q21c = Q[idx * 9 + 5];
-        double q21s = Q[idx * 9 + 6];
-        double q22c = Q[idx * 9 + 7];
-        double q22s = Q[idx * 9 + 8];
-
-        double rt3 = 1.73205080757;
-        double half_rt3 = rt3 * 0.5;
-
-        double Qzz = 2.0 * q20;
-        double Qxx = -0.5 * Qzz + half_rt3 * q22c;
-        double Qyy = -0.5 * Qzz - half_rt3 * q22c;
-        double Qxy = half_rt3 * q22s;
-        double Qxz = half_rt3 * q21c;
-        double Qyz = half_rt3 * q21s;
+	//Initialize quadrupoles
+        double Qxx = Q[idx * 10 + 4];
+        double Qxy = Q[idx * 10 + 5];
+        double Qxz = Q[idx * 10 + 6];
+        double Qyy = Q[idx * 10 + 7];
+        double Qyz = Q[idx * 10 + 8];
+        double Qzz = Q[idx * 10 + 9];
 
         double Q_cart[3][3];
         Q_cart[0][0]=Qxx; Q_cart[0][1]=Qxy; Q_cart[0][2]=Qxz;
@@ -428,9 +405,10 @@ __global__ void interpolate_kernel(
                         double dE_dw = 0.5 * (Q_lat[0]*T_uuw + Q_lat[1]*T_vvw + Q_lat[2]*T_www +
                                               2.0*(Q_lat[3]*T_uvw + Q_lat[4]*T_uww + Q_lat[5]*T_vww));
 
-                        grad_Q_lat[0] += dE_du * val;
-                        grad_Q_lat[1] += dE_dv * val;
-                        grad_Q_lat[2] += dE_dw * val;
+			double factor = 2.0;
+                        grad_Q_lat[0] += dE_du * val * factor;
+                        grad_Q_lat[1] += dE_dv * val * factor;
+                        grad_Q_lat[2] += dE_dw * val * factor;
                     }
                 }
             }
@@ -451,9 +429,9 @@ __global__ void interpolate_kernel(
     }
 
     if (RANK >= 1) {
-        E_atoms[idx * 3 + 0] = -grad_cart[2];
-        E_atoms[idx * 3 + 1] = -grad_cart[0];
-        E_atoms[idx * 3 + 2] = -grad_cart[1];
+        E_atoms[idx * 3 + 0] = -grad_cart[0];
+        E_atoms[idx * 3 + 1] = -grad_cart[1];
+        E_atoms[idx * 3 + 2] = -grad_cart[2];
     }
 
     double grad_U_dip[3] = {0.0};
@@ -498,12 +476,12 @@ __global__ void interpolate_kernel(
                 for(int k=0; k<3; k++)
                     EFG[i][j] += temp[i][k] * A_mat[k][j];
 
-        EG_atoms[idx*6 + 0] = EFG[2][2];
-        EG_atoms[idx*6 + 1] = EFG[0][0];
-        EG_atoms[idx*6 + 2] = EFG[1][1];
-        EG_atoms[idx*6 + 3] = EFG[2][0];
-        EG_atoms[idx*6 + 4] = EFG[2][1];
-        EG_atoms[idx*6 + 5] = EFG[0][1];
+        EG_atoms[idx*6 + 0] = EFG[0][0];
+        EG_atoms[idx*6 + 1] = EFG[0][1];
+        EG_atoms[idx*6 + 2] = EFG[0][2];
+        EG_atoms[idx*6 + 3] = EFG[1][1];
+        EG_atoms[idx*6 + 4] = EFG[1][2];
+        EG_atoms[idx*6 + 5] = EFG[2][2];
     }
 
     force_atoms[idx*3 + 0] = (q_val * grad_cart[0] + grad_U_dip[0] + grad_U_quad[0]);
@@ -654,7 +632,15 @@ at::Tensor assemble_pme_energy_only(
         energy_term -= (p * E).sum(1);
     }
     if (rank >= 2) {
-        energy_term -= (t * dE).sum(1) / 3.0; 
+	at::Tensor prod = t * dE;
+	at::Tensor sum_diag = prod.select(1, 0) +
+                      	      prod.select(1, 3) +
+                              prod.select(1, 5);
+	at::Tensor sum_off  = prod.select(1, 1) +
+			      prod.select(1, 2) +
+			      prod.select(1, 4);
+        // Combine: Diagonals * 1.0 + Off-Diagonals * 2.0
+        energy_term -= (sum_diag + 2.0 * sum_off);
     }
     
     return 0.5 * energy_term.sum();
@@ -687,8 +673,8 @@ struct PMELongRangeFunction : public torch::autograd::Function<PMELongRangeFunct
     // Prepare Q
     at::Tensor q_view = q.view({-1, 1});
     at::Tensor Q_padded;
-    if (rank == 0)      Q_padded = torch::cat({q_view, torch::zeros({N, 8}, coords.options())}, 1);
-    else if (rank == 1) Q_padded = torch::cat({q_view, p, torch::zeros({N, 5}, coords.options())}, 1);
+    if (rank == 0)      Q_padded = torch::cat({q_view, torch::zeros({N, 9}, coords.options())}, 1);
+    else if (rank == 1) Q_padded = torch::cat({q_view, p, torch::zeros({N, 6}, coords.options())}, 1);
     else                Q_padded = torch::cat({q_view, p, t}, 1);
 
     at::Tensor Q_combined = Q_padded.contiguous();
@@ -696,7 +682,7 @@ struct PMELongRangeFunction : public torch::autograd::Function<PMELongRangeFunct
 
     at::Tensor phi = torch::zeros({N}, options);
     at::Tensor E   = torch::zeros({N, 3}, options);
-    at::Tensor EG  = torch::zeros({N, 5}, options);
+    at::Tensor EG  = torch::zeros({N, 6}, options);
     at::Tensor forces = torch::zeros({N, 3}, options); 
     at::Tensor grid_scratch = torch::zeros({K1, K2, K3}, options);
 
@@ -741,11 +727,6 @@ struct PMELongRangeFunction : public torch::autograd::Function<PMELongRangeFunct
                   << "   Factor: " << factor_EG << "\n"
                   << "   Vector: " << (t[0] * factor_EG).cpu() << std::endl;
     }
-
-    // Note: 'forces' here are from Reciprocal Space only. 
-    // They do not include the self-energy force correction (which is usually 0 for Gaussians unless multipoles move relative to local frame, 
-    // or if you need to subtract the self-force from the direct sum part).
-    
     at::Tensor energy = assemble_pme_energy_only(q, p, t, phi, E, EG, rank);
     
     return {phi, E, EG, energy, forces};

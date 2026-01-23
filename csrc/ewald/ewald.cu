@@ -366,16 +366,12 @@ __global__ void compute_ewald_dynamics_fused(
     }
 }
 
-// ============================================================================
-// HOST ENTRY POINT
-// ============================================================================
-
 struct EwaldLongRangeAllFunctionCuda : public torch::autograd::Function<EwaldLongRangeAllFunctionCuda> {
   static torch::autograd::variable_list forward(
       torch::autograd::AutogradContext* ctx,
       at::Tensor coords, at::Tensor box, at::Tensor q, at::Tensor p, at::Tensor t,
       at::Tensor K_t, at::Tensor rank_t, at::Tensor alpha_t) {
-    
+
     int64_t K   = K_t.item<int64_t>();
     int64_t rank= rank_t.item<int64_t>();
     double alpha= alpha_t.item<double>();
@@ -391,7 +387,7 @@ struct EwaldLongRangeAllFunctionCuda : public torch::autograd::Function<EwaldLon
     memcpy(h_box, box_c.data_ptr<double>(), 9*sizeof(double));
     double V = h_box[0]*(h_box[4]*h_box[8]-h_box[5]*h_box[7]) - h_box[1]*(h_box[3]*h_box[8]-h_box[5]*h_box[6]) + h_box[2]*(h_box[3]*h_box[7]-h_box[4]*h_box[6]);
 
-    // 2. Prepare Constants)
+    // 2. Prepare Constants
     auto recip = at::empty({3,3}, opts);
     reciprocal_box_kernel<double><<<1,1,0,stream>>>(box.data_ptr<double>(), recip.data_ptr<double>(), V);
 
@@ -402,7 +398,7 @@ struct EwaldLongRangeAllFunctionCuda : public torch::autograd::Function<EwaldLon
     auto kvec = at::empty({3, M1}, opts);
     auto gauss = at::empty({M1}, opts);
     auto sym   = at::empty({M1}, opts);
-    
+
     {
         dim3 block(256), grid((unsigned)((M + block.x - 1)/block.x));
         prepare_k_constants_kernel<double><<<grid, block, 0, stream>>>(
@@ -418,8 +414,8 @@ struct EwaldLongRangeAllFunctionCuda : public torch::autograd::Function<EwaldLon
     auto Sreal = at::zeros({M1}, opts);
     auto Simag = at::zeros({M1}, opts);
     {
-        dim3 grid((unsigned)M1); // Parallelize over K
-        dim3 block(256);         // Threads sum over Atoms
+        dim3 grid((unsigned)M1);
+        dim3 block(256);
         compute_structure_factor_fused<double><<<grid, block, 0, stream>>>(
             M1, N,
             kvec.data_ptr<double>(),
@@ -460,21 +456,13 @@ struct EwaldLongRangeAllFunctionCuda : public torch::autograd::Function<EwaldLon
             energy.data_ptr<double>()
         );
     }
-    
+
     // Reshape grad to (N,3,3)
     at::Tensor grad_reshaped = grad.reshape({N,3,3});
 
-#if EWALD_DBG
-    if (pot.numel()>=3) {
-      std::cout << "[AUTO] pot[0..2]="
-                << pot[0].item<double>() << " "
-                << pot[1].item<double>() << " "
-                << pot[2].item<double>() << "\n";
-    }
-#endif
-
-    // Save forces for backward
-    ctx->save_for_backward({forces});
+    // --- CRITICAL CHANGE: SAVE MORE TENSORS ---
+    // We need 'field' (for d_p), 'grad_reshaped' (for d_t and cross-force), and 'rank_t'.
+    ctx->save_for_backward({forces, field, grad_reshaped, rank_t});
 
     // Prepare output list
     torch::autograd::variable_list out(5);
@@ -491,30 +479,61 @@ struct EwaldLongRangeAllFunctionCuda : public torch::autograd::Function<EwaldLon
       torch::autograd::variable_list grad_outputs) {
 
     // grad_outputs: [g_potential, g_field, g_grad, g_energy, g_forces]
-    const at::Tensor& gE = grad_outputs[3]; // scalar
+    const at::Tensor& g_field  = grad_outputs[1]; // Gradient from Field coupling (Polarization)
+    const at::Tensor& g_energy = grad_outputs[3]; // Gradient from Energy (Scalar)
 
+    // Retrieve saved tensors
     auto saved = ctx->get_saved_variables();
-    const at::Tensor& F = saved[0]; // (N,3)
+    const at::Tensor& forces_internal = saved[0]; // (N,3)
+    const at::Tensor& field           = saved[1]; // (N,3)
+    const at::Tensor& field_grad      = saved[2]; // (N,3,3)
+    const at::Tensor& rank_t          = saved[3]; // Scalar Tensor
 
-    at::Tensor dcoords;
-    if (gE.defined()) {
-      // dL/dcoords = -gE * forces
-      auto scale = (gE.dim()==0) ? gE.view({1,1}) : gE;
-      dcoords = -(scale) * F;
-      if (!dcoords.sizes().equals(F.sizes())) {
-        dcoords = dcoords.expand_as(F).contiguous();
-      }
-    } else {
-      dcoords = at::zeros_like(F);
+    int64_t rank = rank_t.item<int64_t>();
+
+    // --- 1. Compute d_coords (Forces) ---
+    at::Tensor dcoords = at::zeros_like(forces_internal);
+
+    // Part A: Contribution from Energy (Standard Force)
+    if (g_energy.defined()) {
+      auto scale = (g_energy.dim()==0) ? g_energy.view({1,1}) : g_energy;
+      // Note: "forces_internal" is usually calculated as -dE/dx.
+      // If g_energy is positive, we want the gradient, so -force.
+      dcoords -= scale * forces_internal;
+    }
+
+    // Part B: Contribution from Field (Cross Terms / Polarization)
+    // If we have a gradient w.r.t Field (from Polarization),
+    // we add force: (p_induced . grad_permanent)
+    //if (g_field.defined()) {
+        // einsum: (N,3) * (N,3,3) -> (N,3)
+    //    at::Tensor force_from_field = at::einsum("ni, nij -> nj", {g_field, field_grad});
+    //    dcoords += force_from_field;
+    //}
+
+    // --- 2. Compute d_p (Torque on Dipoles) ---
+    at::Tensor d_p;
+    if (rank >= 1 && g_energy.defined()) {
+         auto scale = (g_energy.dim()==0) ? g_energy : g_energy.view({1,1});
+         // dE/dp = -Field
+         d_p = -field * scale;
+    }
+
+    // --- 3. Compute d_t (Torque on Quadrupoles) ---
+    at::Tensor d_t;
+    if (rank >= 2 && g_energy.defined()) {
+         auto scale = (g_energy.dim()==0) ? g_energy : g_energy.view({1,1,1});
+         // dE/dQ = -1/3 * Gradient(Field)
+         d_t = (-1.0/3.0) * field_grad * scale;
     }
 
     torch::autograd::variable_list grads(8);
     grads[0] = dcoords;      // d/d coords
-    grads[1] = at::Tensor(); // d/d box   (not implemented)
-    grads[2] = at::Tensor(); // d/d q     (not implemented)
-    grads[3] = at::Tensor(); // d/d p     (not implemented)
-    grads[4] = at::Tensor(); // d/d t     (not implemented)
-    grads[5] = at::Tensor(); // d/d K_t   (int scalar -> no grad)
+    grads[1] = at::Tensor(); // d/d box
+    grads[2] = at::Tensor(); // d/d q
+    grads[3] = d_p;          // d/d p (Dipoles)
+    grads[4] = d_t;          // d/d t (Quadrupoles)
+    grads[5] = at::Tensor(); // d/d K_t
     grads[6] = at::Tensor(); // d/d rank_t
     grads[7] = at::Tensor(); // d/d alpha_t
     return grads;
