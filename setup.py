@@ -18,7 +18,7 @@ def build_cuda_extension(name, exclude_files=list()):
         sources=sources,
         extra_compile_args={
             'cxx': ['-O3'],
-            'nvcc': ['-O3', '-arch=sm_80']
+            'nvcc': ['-O3']
         },
         include_dirs=[os.path.join(os.path.dirname(__file__), "csrc")]
     )
@@ -41,6 +41,7 @@ setup(
         build_cuda_extension('coulomb'),
         build_cuda_extension('multipoles'),
         build_cuda_extension('ewald'),
+        build_cuda_extension('pme'),
         build_cuda_extension('cmm')
     ],
     cmdclass={
