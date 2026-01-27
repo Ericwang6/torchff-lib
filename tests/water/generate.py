@@ -3,7 +3,7 @@ import openmm.app as app
 import openmm.unit as unit
 
 
-num_waters = 100
+num_waters = 1000000
 box_size = (num_waters / (6.02 * 100 / 18)) ** (1/3)
 
 ff = app.ForceField('tip3p.xml')

@@ -142,9 +142,11 @@ public:
         at::Tensor epsilon_grad = at::zeros_like(epsilon, epsilon.options());
         at::Tensor charges_grad = at::zeros_like(charges, charges.options());
 
+        auto props = at::cuda::getCurrentDeviceProperties();
         auto stream = at::cuda::getCurrentCUDAStream();
         int32_t block_dim = 512;
-        int32_t grid_dim = (npairs + block_dim - 1) / block_dim;
+        int32_t grid_dim = std::min(props->maxBlocksPerMultiProcessor*props->multiProcessorCount, (npairs+block_dim-1)/block_dim);
+    
         AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "compute_nonbonded_cuda", ([&] {
             nonbonded_atom_pairs_kernel<scalar_t><<<grid_dim, block_dim, 0, stream>>>(
                 coords.data_ptr<scalar_t>(),
@@ -228,10 +230,13 @@ void compute_nonbonded_forces_from_atom_pairs_cuda(
     // at::linalg_inv does not support CUDA graph
     at::Tensor box_inv, ignore;
     std::tie(box_inv, ignore) = at::linalg_inv_ex(box, false);
+
+    auto props = at::cuda::getCurrentDeviceProperties();
     auto stream = at::cuda::getCurrentCUDAStream();
     int32_t npairs = pairs.size(0);
     int32_t block_dim = 512;
-    int32_t grid_dim = (npairs + block_dim - 1) / block_dim;
+    int32_t grid_dim = std::min(props->maxBlocksPerMultiProcessor*props->multiProcessorCount, (npairs+block_dim-1)/block_dim);
+
     AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "compute_nonbonded_cuda", ([&] {
         nonbonded_atom_pairs_kernel<scalar_t><<<grid_dim, block_dim, 0, stream>>>(
             coords.data_ptr<scalar_t>(),
