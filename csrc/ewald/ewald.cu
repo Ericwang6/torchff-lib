@@ -501,16 +501,6 @@ struct EwaldLongRangeAllFunctionCuda : public torch::autograd::Function<EwaldLon
       // If g_energy is positive, we want the gradient, so -force.
       dcoords -= scale * forces_internal;
     }
-
-    // Part B: Contribution from Field (Cross Terms / Polarization)
-    // If we have a gradient w.r.t Field (from Polarization),
-    // we add force: (p_induced . grad_permanent)
-    //if (g_field.defined()) {
-        // einsum: (N,3) * (N,3,3) -> (N,3)
-    //    at::Tensor force_from_field = at::einsum("ni, nij -> nj", {g_field, field_grad});
-    //    dcoords += force_from_field;
-    //}
-
     // --- 2. Compute d_p (Torque on Dipoles) ---
     at::Tensor d_p;
     if (rank >= 1 && g_energy.defined()) {

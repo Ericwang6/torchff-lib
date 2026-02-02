@@ -180,16 +180,48 @@ __global__ void spread_q_kernel(
                         dt_dr[2] += n_star[i][2] * grid_K[i] * dt_du[i];
                     }
                     term -= px * dt_dr[0] + py * dt_dr[1] + pz * dt_dr[2];
+		if (RANK >= 2) {
+                         // 1. Load Cartesian Quadrupoles
+                         double Qxx = Q[idx * 10 + 4];
+                         double Qxy = Q[idx * 10 + 5];
+                         double Qxz = Q[idx * 10 + 6];
+                         double Qyy = Q[idx * 10 + 7];
+                         double Qyz = Q[idx * 10 + 8];
+                         double Qzz = Q[idx * 10 + 9];
 
-                    if (RANK >= 2) {
-			 //initialize quadrupoles
-			 double Qxx = Q[idx * 10 + 4];
-			 double Qxy = Q[idx * 10 + 5];
-			 double Qxz = Q[idx * 10 + 6];
-			 double Qyy = Q[idx * 10 + 7];
-			 double Qyz = Q[idx * 10 + 8];
-			 double Qzz = Q[idx * 10 + 9];
-			 //initialize b-spline double primes
+                         // 2. Compute Transformation Matrix A = K * n_star
+                         // A maps Cartesian coords (r) to Grid coords (u)
+                         double A[3][3];
+                         #pragma unroll
+                         for(int i=0; i<3; i++)
+                             for(int j=0; j<3; j++)
+                                 A[i][j] = grid_K[i] * n_star[i][j];
+
+                         // 3. Transform Q_cart to Q_lat
+                         // Q_lat = A * Q_cart * A^T
+                         double Q_cart[3][3];
+                         Q_cart[0][0]=Qxx; Q_cart[0][1]=Qxy; Q_cart[0][2]=Qxz;
+                         Q_cart[1][0]=Qxy; Q_cart[1][1]=Qyy; Q_cart[1][2]=Qyz;
+                         Q_cart[2][0]=Qxz; Q_cart[2][1]=Qyz; Q_cart[2][2]=Qzz;
+
+                         double Q_temp[3][3] = {0};
+                         #pragma unroll
+                         for(int i=0; i<3; i++)
+                             for(int j=0; j<3; j++)
+                                 for(int k=0; k<3; k++)
+                                     Q_temp[i][j] += Q_cart[i][k] * A[j][k]; // Q * A^T (symmetric)
+
+                         double Q_lat[3][3] = {0};
+                         #pragma unroll
+                         for(int i=0; i<3; i++)
+                             for(int j=0; j<3; j++)
+                                 for(int k=0; k<3; k++)
+                                     Q_lat[i][j] += A[i][k] * Q_temp[k][j]; // A * (Q * A^T)
+
+                         double Q_lat_xx = Q_lat[0][0]; double Q_lat_yy = Q_lat[1][1]; double Q_lat_zz = Q_lat[2][2];
+                         double Q_lat_xy = Q_lat[0][1]; double Q_lat_xz = Q_lat[0][2]; double Q_lat_yz = Q_lat[1][2];
+
+                         // 4. Compute B-Spline Lattice Hessians (Hu_vals)
                          double d2t_du2[3];
                          d2t_du2[0] = d2Mx * My * Mz;
                          d2t_du2[1] = Mx * d2My * Mz;
@@ -198,35 +230,25 @@ __global__ void spread_q_kernel(
                          d2t_du_mix[0] = dMx * dMy * Mz;
                          d2t_du_mix[1] = dMx * My * dMz;
                          d2t_du_mix[2] = Mx * dMy * dMz;
-
+                         
                          double Hu_vals[3][3];
                          Hu_vals[0][0] = d2t_du2[0]; Hu_vals[1][1] = d2t_du2[1]; Hu_vals[2][2] = d2t_du2[2];
-                         Hu_vals[0][1] = d2t_du_mix[0]; Hu_vals[1][0] = d2t_du_mix[0];
-                         Hu_vals[0][2] = d2t_du_mix[1]; Hu_vals[2][0] = d2t_du_mix[1];
-                         Hu_vals[1][2] = d2t_du_mix[2]; Hu_vals[2][1] = d2t_du_mix[2];
+                         Hu_vals[0][1] = d2t_du_mix[0]; 
+                         Hu_vals[0][2] = d2t_du_mix[1]; 
+                         Hu_vals[1][2] = d2t_du_mix[2];
 
-                         double H_r[3][3] = {0};
-                         #pragma unroll
-                         for(int i=0; i<3; i++) {
-                             #pragma unroll
-                             for(int j=0; j<3; j++) {
-                                 double val = 0.0;
-                                 #pragma unroll
-                                 for(int m=0; m<3; m++) {
-                                     #pragma unroll
-                                     for(int n=0; n<3; n++) {
-                                         val += n_star[m][i]*grid_K[m] * n_star[n][j]*grid_K[n] * Hu_vals[m][n];
-                                     }
-                                 }
-                                 H_r[i][j] = val;
-                             }
-                         }
-
-
-			 double interaction = Qxx * Hu_vals[0][0] + Qyy * Hu_vals[1][1] + Qzz * Hu_vals[2][2] + 2*(Qxy * Hu_vals[0][1] + Qxz * Hu_vals[0][2] + Qyz * Hu_vals[1][2]);
-			 interaction *= 0.5;
+                         // 5. Contract Lattice Quadrupole with Lattice Hessian
+                         double interaction = Q_lat_xx * Hu_vals[0][0] + 
+                                              Q_lat_yy * Hu_vals[1][1] + 
+                                              Q_lat_zz * Hu_vals[2][2] + 
+                                              2.0 * (Q_lat_xy * Hu_vals[0][1] + 
+                                                     Q_lat_xz * Hu_vals[0][2] + 
+                                                     Q_lat_yz * Hu_vals[1][2]);
+                         
+                         interaction *= 0.5;
                          term += interaction;
                     }
+
                 }
 
                 int grid_ptr = gx * K2 * K3 + gy * K3 + gz;
@@ -405,10 +427,9 @@ __global__ void interpolate_kernel(
                         double dE_dw = 0.5 * (Q_lat[0]*T_uuw + Q_lat[1]*T_vvw + Q_lat[2]*T_www +
                                               2.0*(Q_lat[3]*T_uvw + Q_lat[4]*T_uww + Q_lat[5]*T_vww));
 
-			double factor = 2.0;
-                        grad_Q_lat[0] += dE_du * val * factor;
-                        grad_Q_lat[1] += dE_dv * val * factor;
-                        grad_Q_lat[2] += dE_dw * val * factor;
+                        grad_Q_lat[0] += dE_du * val;
+                        grad_Q_lat[1] += dE_dv * val;
+                        grad_Q_lat[2] += dE_dw * val;
                     }
                 }
             }
@@ -429,9 +450,9 @@ __global__ void interpolate_kernel(
     }
 
     if (RANK >= 1) {
-        E_atoms[idx * 3 + 0] = -grad_cart[0];
-        E_atoms[idx * 3 + 1] = -grad_cart[1];
-        E_atoms[idx * 3 + 2] = -grad_cart[2];
+        E_atoms[idx * 3 + 0] = grad_cart[0];
+        E_atoms[idx * 3 + 1] = grad_cart[1];
+        E_atoms[idx * 3 + 2] = grad_cart[2];
     }
 
     double grad_U_dip[3] = {0.0};
@@ -475,18 +496,18 @@ __global__ void interpolate_kernel(
             for(int j=0; j<3; j++)
                 for(int k=0; k<3; k++)
                     EFG[i][j] += temp[i][k] * A_mat[k][j];
-
-        EG_atoms[idx*6 + 0] = EFG[0][0];
-        EG_atoms[idx*6 + 1] = EFG[0][1];
-        EG_atoms[idx*6 + 2] = EFG[0][2];
-        EG_atoms[idx*6 + 3] = EFG[1][1];
-        EG_atoms[idx*6 + 4] = EFG[1][2];
-        EG_atoms[idx*6 + 5] = EFG[2][2];
+	double factor = -0.5;
+        EG_atoms[idx*6 + 0] = EFG[0][0] * factor;
+        EG_atoms[idx*6 + 1] = EFG[0][1] * factor;
+        EG_atoms[idx*6 + 2] = EFG[0][2] * factor;
+        EG_atoms[idx*6 + 3] = EFG[1][1] * factor;
+        EG_atoms[idx*6 + 4] = EFG[1][2] * factor;
+        EG_atoms[idx*6 + 5] = EFG[2][2] * factor;
     }
 
-    force_atoms[idx*3 + 0] = (q_val * grad_cart[0] + grad_U_dip[0] + grad_U_quad[0]);
-    force_atoms[idx*3 + 1] = (q_val * grad_cart[1] + grad_U_dip[1] + grad_U_quad[1]);
-    force_atoms[idx*3 + 2] = (q_val * grad_cart[2] + grad_U_dip[2] + grad_U_quad[2]);
+    force_atoms[idx*3 + 0] = (q_val * grad_cart[0] - grad_U_dip[0] + grad_U_quad[0]);
+    force_atoms[idx*3 + 1] = (q_val * grad_cart[1] - grad_U_dip[1] + grad_U_quad[1]);
+    force_atoms[idx*3 + 2] = (q_val * grad_cart[2] - grad_U_dip[2] + grad_U_quad[2]);
 }
 // ============================================================================
 // 4. Combined B-Spline Helper & Convolution
@@ -645,7 +666,6 @@ at::Tensor assemble_pme_energy_only(
     
     return 0.5 * energy_term.sum();
 }
-
 struct PMELongRangeFunction : public torch::autograd::Function<PMELongRangeFunction> {
 
   static torch::autograd::variable_list forward(
@@ -659,6 +679,7 @@ struct PMELongRangeFunction : public torch::autograd::Function<PMELongRangeFunct
     double alpha = alpha_t.item<double>();
     int rank = rank_t.item<int64_t>();
 
+    // --- 1. Setup Grid & Geometry ---
     int K1, K2, K3;
     if (K_t.numel() == 1) {
         K1 = K2 = K3 = K_t.item<int64_t>();
@@ -670,7 +691,7 @@ struct PMELongRangeFunction : public torch::autograd::Function<PMELongRangeFunct
     double volume = torch::det(box).item<double>();
     int N = coords.size(0);
 
-    // Prepare Q
+    // --- 2. Prepare Multipole Tensor ---
     at::Tensor q_view = q.view({-1, 1});
     at::Tensor Q_padded;
     if (rank == 0)      Q_padded = torch::cat({q_view, torch::zeros({N, 9}, coords.options())}, 1);
@@ -680,62 +701,158 @@ struct PMELongRangeFunction : public torch::autograd::Function<PMELongRangeFunct
     at::Tensor Q_combined = Q_padded.contiguous();
     auto options = coords.options();
 
+    // --- 3. Allocate Outputs ---
     at::Tensor phi = torch::zeros({N}, options);
     at::Tensor E   = torch::zeros({N, 3}, options);
-    at::Tensor EG  = torch::zeros({N, 6}, options);
-    at::Tensor forces = torch::zeros({N, 3}, options); 
+    at::Tensor EG  = torch::zeros({N, 6}, options); // Flat (xx, xy, xz, yy, yz, zz)
+    at::Tensor forces = torch::zeros({N, 3}, options);
     at::Tensor grid_scratch = torch::zeros({K1, K2, K3}, options);
 
-    // Call Pipeline with Forces
+    // --- 4. Run CUDA Pipeline ---
     compute_pme_cuda_pipeline(
         coords, Q_combined, recip_vecs, grid_scratch,
-        phi, E, EG, forces, 
+        phi, E, EG, forces,
         alpha, volume, K1, K2, K3, rank
     );
 
+    // --- 5. Apply Self-Corrections ---
     double pi = CUDART_PI;
     double alpha_over_root_pi = alpha / sqrt(pi);
     double alpha2 = alpha * alpha;
 
-    // A. Potential Correction
     phi.sub_(q * (2.0 * alpha_over_root_pi));
-    // --- Rank 1: Dipole Correction ---
+
     if (rank >= 1) {
         double factor_E = alpha_over_root_pi * (4.0 * alpha2 / 3.0);
-
-        // 1. Apply correction to ALL atoms
-        E.add_(p * factor_E);
-
-        // 2. Print ONLY for Atom 0
-        // We calculate the specific correction vector for the first atom: (p[0] * factor)
-        // We use .cpu() to ensure we can print the tensor data from the Host.
-        std::cout << "DEBUG Atom 0 [Dipole Correction]: \n"
-                  << "   Factor: " << factor_E << "\n"
-                  << "   Vector: " << (p[0] * factor_E).cpu() << std::endl;
+        E.add_(p * factor_E); // self-field
     }
 
-    // --- Rank 2: Quadrupole Correction ---
     if (rank >= 2) {
         double alpha4 = alpha2 * alpha2;
         double factor_EG = alpha_over_root_pi * (16.0 * alpha4 / 5.0) / 3.0;
-
-        // 1. Apply correction to ALL atoms
-        EG.add_(t * factor_EG);
-
-        // 2. Print ONLY for Atom 0
-        std::cout << "DEBUG Atom 0 [Quad Correction]: \n"
-                  << "   Factor: " << factor_EG << "\n"
-                  << "   Vector: " << (t[0] * factor_EG).cpu() << std::endl;
+        EG.add_(t * factor_EG); // self-field-gradient
     }
+
+    // --- 6. Compute Total Energy ---
     at::Tensor energy = assemble_pme_energy_only(q, p, t, phi, E, EG, rank);
-    
-    return {phi, E, EG, energy, forces};
+
+    // --- 7. Reshape EG to (N,3,3) for Backward Pass ---
+    at::Tensor EG_reshaped = torch::zeros({N, 3, 3}, options);
+    if (rank >= 2) {
+        // EG is stored as: 0:xx, 1:xy, 2:xz, 3:yy, 4:yz, 5:zz
+        at::Tensor xx = EG.select(1, 0);
+        at::Tensor xy = EG.select(1, 1);
+        at::Tensor xz = EG.select(1, 2);
+        at::Tensor yy = EG.select(1, 3);
+        at::Tensor yz = EG.select(1, 4);
+        at::Tensor zz = EG.select(1, 5);
+
+        // Row 0
+        EG_reshaped.select(1, 0).select(1, 0).copy_(xx);
+        EG_reshaped.select(1, 0).select(1, 1).copy_(xy);
+        EG_reshaped.select(1, 0).select(1, 2).copy_(xz);
+        // Row 1 (Symmetric)
+        EG_reshaped.select(1, 1).select(1, 0).copy_(xy);
+        EG_reshaped.select(1, 1).select(1, 1).copy_(yy);
+        EG_reshaped.select(1, 1).select(1, 2).copy_(yz);
+        // Row 2 (Symmetric)
+        EG_reshaped.select(1, 2).select(1, 0).copy_(xz);
+        EG_reshaped.select(1, 2).select(1, 1).copy_(yz);
+        EG_reshaped.select(1, 2).select(1, 2).copy_(zz);
+    }
+
+    // --- 8. Save Variables for Backward ---
+    // We save: Forces, Field(E), Field Gradient(EG_3x3), Rank, Alpha
+    ctx->save_for_backward({forces, E, EG_reshaped, rank_t, alpha_t, p ,t});
+
+    return {phi, E, EG_reshaped, energy, forces};
   }
 
   static torch::autograd::variable_list backward(torch::autograd::AutogradContext* ctx, torch::autograd::variable_list grad_outputs) {
-    return {torch::zeros_like(grad_outputs[1]), at::Tensor(), at::Tensor(), at::Tensor(), at::Tensor(), at::Tensor(), at::Tensor(), at::Tensor()};
+    // grad_outputs order: [0:phi, 1:E, 2:EG, 3:energy, 4:forces]
+
+    // We care about derivatives w.r.t Energy (scalar) and potentially Field (polarization)
+    const at::Tensor& g_energy = grad_outputs[3];
+    const at::Tensor& g_field  = grad_outputs[1];
+
+    // Retrieve saved tensors
+    auto saved = ctx->get_saved_variables();
+    const at::Tensor& forces_internal = saved[0]; // (N,3) Calculated Forces (-dE/dx)
+    const at::Tensor& field           = saved[1]; // (N,3) Electric Field
+    const at::Tensor& field_grad      = saved[2]; // (N,3,3) Hessian
+    const at::Tensor& rank_t          = saved[3];
+    const at::Tensor& alpha_t         = saved[4];
+    const at::Tensor& p               = saved[5];
+    const at::Tensor& t               = saved[6];
+
+    int64_t rank = rank_t.item<int64_t>();
+    double alpha = alpha_t.item<double>();
+    double pi = 3.14159265358979323846;
+    double alpha_over_root_pi = alpha / sqrt(pi);
+    double alpha2 = alpha * alpha;
+
+    // --- A. Compute d_coords (Forces on Atoms) ---
+    at::Tensor dcoords = torch::zeros_like(forces_internal);
+
+    // 1. Contribution from Energy Gradient
+    if (g_energy.defined()) {
+        auto scale = (g_energy.dim()==0) ? g_energy.view({1,1}) : g_energy;
+        // PME returns force F = -dE/dx.
+        // We want dL/dx = dL/dE * dE/dx = g_energy * (-F)
+        dcoords.sub_(forces_internal * scale);
+    }
+
+    // --- B. Compute d_p (Torque on Dipoles) ---
+    at::Tensor d_p;
+    if (rank >= 1 && g_energy.defined()) {
+         auto scale = (g_energy.dim()==0) ? g_energy : g_energy.view({1,1});
+         // dE/dp = -Field
+         // dL/dp = dL/dE * -E
+	 double factor_E = alpha_over_root_pi * (4.0 * alpha2 / 3.0);
+
+        // dL/dp = g_energy * (-Field - 0.5 * factor_E * p)
+         d_p = (-field - (0.5 * factor_E * p)) * scale;
+    }
+
+    // --- C. Compute d_t (Torque on Quadrupoles) ---
+    at::Tensor d_t;
+    if (rank >= 2 && g_energy.defined()) {
+    	auto scale = (g_energy.dim() == 0) ? g_energy : g_energy.view({1, 1});
+        double alpha4 = alpha2 * alpha2;
+        double factor_EG = alpha_over_root_pi * (16.0 * alpha4 / 5.0) / 3.0;
+	// Extract field gradient components from the (N,3,3) tensor
+	auto EG_xx = field_grad.select(1, 0).select(1, 0);
+	auto EG_xy = field_grad.select(1, 0).select(1, 1);
+	auto EG_xz = field_grad.select(1, 0).select(1, 2);
+	auto EG_yy = field_grad.select(1, 1).select(1, 1);
+	auto EG_yz = field_grad.select(1, 1).select(1, 2);
+	auto EG_zz = field_grad.select(1, 2).select(1, 2);
+
+	//Apply 2.0 to off-diagonals and 0.5 * factor to diagonals
+	auto d_t_xx = (-EG_xx - 0.5 * factor_EG * t.select(1, 0)) * scale;
+ 	auto d_t_xy = (-EG_xy * 2.0) * scale;
+	auto d_t_xz = (-EG_xz * 2.0) * scale;
+	auto d_t_yy = (-EG_yy - 0.5 * factor_EG * t.select(1, 3)) * scale;
+	auto d_t_yz = (-EG_yz * 2.0) * scale;
+	auto d_t_zz = (-EG_zz - 0.5 * factor_EG * t.select(1, 5)) * scale;
+
+	d_t = torch::stack({d_t_xx, d_t_xy, d_t_xz, d_t_yy, d_t_yz, d_t_zz}, 1);
+    }
+
+    // --- Output List ---
+    return {
+        dcoords,        // coords
+        at::Tensor(),   // box 
+        at::Tensor(),   // q (monopoles)
+        d_p,            // p (Dipoles)
+        d_t,            // t (Quadrupoles)
+        at::Tensor(),   // K
+        at::Tensor(),   // rank
+        at::Tensor()    // alpha
+    };
   }
 };
+
 
 TORCH_LIBRARY_IMPL(torchff, AutogradCUDA, m) {
   m.impl("pme_long_range",
@@ -745,5 +862,5 @@ TORCH_LIBRARY_IMPL(torchff, AutogradCUDA, m) {
            auto alpha_t = at::scalar_tensor(alpha, at::TensorOptions().dtype(at::kDouble).device(coords.device()));
            auto outs = PMELongRangeFunction::apply(coords, box, q, p, t, K_t, rank_t, alpha_t);
            return std::make_tuple(outs[0], outs[1], outs[2], outs[3], outs[4]);
-         });
+	   });
 }
