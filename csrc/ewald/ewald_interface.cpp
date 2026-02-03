@@ -4,8 +4,11 @@
 
 TORCH_LIBRARY_FRAGMENT(torchff, m) {
   m.def("ewald_long_range(Tensor coords, Tensor box, "
-        "Tensor q, Tensor p, Tensor t, int K, int rank, float alpha) "
-        "-> (Tensor, Tensor, Tensor, Tensor, Tensor)");
+        "Tensor q, Tensor? p, Tensor? t, Scalar k_max, Scalar alpha) "
+        "-> Tensor");
+  m.def("ewald_long_range_all(Tensor coords, Tensor box, "
+        "Tensor q, Tensor? p, Tensor? t, Scalar k_max, Scalar alpha) "
+        "-> (Tensor, Tensor, Tensor)");
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

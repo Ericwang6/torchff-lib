@@ -23,6 +23,11 @@ template <typename scalar_t> __device__ __forceinline__ scalar_t sin_(scalar_t x
 template<> __device__ __forceinline__ float sin_(float x) { return ::sin(x); };
 template<> __device__ __forceinline__ double sin_(double x) { return ::sinf(x); };
 
+// sincos
+template <typename scalar_t> __device__ __forceinline__ void sincos_(scalar_t x, scalar_t* s, scalar_t* c) {};
+template<> __device__ __forceinline__ void sincos_(float x, float* s, float* c) { ::sincosf(x, s, c); };
+template<> __device__ __forceinline__ void sincos_(double x, double* s, double* c) { ::sincos(x, s, c); };
+
 // clamp
 template <typename scalar_t> __device__ __forceinline__ scalar_t clamp_(scalar_t x, scalar_t lo, scalar_t hi) {};
 template<> __device__ __forceinline__ float clamp_(float x, float lo, float hi) { return ::fminf( ::fmaxf(x, lo), hi ); };
