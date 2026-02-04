@@ -13,10 +13,10 @@
 template <typename scalar_t>
 __global__ void harmonic_angle_cuda_kernel(
     scalar_t* coords, 
-    int32_t* angles, 
+    int64_t* angles, 
     scalar_t* theta0, 
     scalar_t* k, 
-    int32_t nangles,
+    int64_t nangles,
     scalar_t* ene,
     scalar_t* coord_grad, 
     scalar_t* theta0_grad, 
@@ -24,10 +24,10 @@ __global__ void harmonic_angle_cuda_kernel(
     scalar_t sign
 ) {
     for (int index = threadIdx.x+blockIdx.x*blockDim.x; index < nangles; index += blockDim.x*gridDim.x) {
-        int32_t offset = index * 3;
-        int32_t offset_0 = angles[offset] * 3;
-        int32_t offset_1 = angles[offset + 1] * 3;
-        int32_t offset_2 = angles[offset + 2] * 3;
+        int64_t offset = index * 3;
+        int64_t offset_0 = angles[offset] * 3;
+        int64_t offset_1 = angles[offset + 1] * 3;
+        int64_t offset_2 = angles[offset + 2] * 3;
     
         scalar_t* coords_0 = coords + offset_0;
         scalar_t* coords_1 = coords + offset_1;
@@ -103,14 +103,14 @@ public:
         at::Tensor& k
     )
     {
-        int32_t nangles = angles.size(0);
+        int nangles = angles.size(0);
         
         auto props = at::cuda::getCurrentDeviceProperties();
         auto stream = at::cuda::getCurrentCUDAStream();
         
-        int32_t block_dim = 256;
-        int32_t grid_dim = std::min(
-            (nangles + block_dim - 1) / block_dim,
+        constexpr int BLOCK_SIZE = 256;
+        int GRID_SIZE = std::min(
+            (nangles + BLOCK_SIZE - 1) / BLOCK_SIZE,
             props->multiProcessorCount*props->maxBlocksPerMultiProcessor
         );
 
@@ -120,9 +120,9 @@ public:
         at::Tensor k_grad = at::zeros_like(k, k.options());
 
         AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "compute_harmonic_angle_cuda", ([&] {
-            harmonic_angle_cuda_kernel<scalar_t><<<grid_dim, block_dim, 0, stream>>>(
+            harmonic_angle_cuda_kernel<scalar_t><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(
                 coords.data_ptr<scalar_t>(),
-                angles.data_ptr<int32_t>(),
+                angles.data_ptr<int64_t>(),
                 theta0.data_ptr<scalar_t>(),
                 k.data_ptr<scalar_t>(),
                 nangles,
@@ -168,19 +168,20 @@ void compute_harmonic_angle_forces_cuda(
     at::Tensor& forces
 ) {
 
-    int32_t nangles = angles.size(0);
+    int nangles = angles.size(0);
     auto props = at::cuda::getCurrentDeviceProperties();
     auto stream = at::cuda::getCurrentCUDAStream();
     
-    int32_t block_dim = 256;
-    int32_t grid_dim = std::min(
-        (nangles + block_dim - 1) / block_dim,
+    constexpr int BLOCK_SIZE = 256;
+    int GRID_SIZE = std::min(
+        (nangles + BLOCK_SIZE - 1) / BLOCK_SIZE,
         props->multiProcessorCount*props->maxBlocksPerMultiProcessor
     );
+
     AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "compute_harmonic_angle_forces_cuda", ([&] {
-        harmonic_angle_cuda_kernel<scalar_t><<<grid_dim, block_dim, 0, stream>>>(
+        harmonic_angle_cuda_kernel<scalar_t><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(
             coords.data_ptr<scalar_t>(),
-            angles.data_ptr<int32_t>(),
+            angles.data_ptr<int64_t>(),
             theta0.data_ptr<scalar_t>(),
             k.data_ptr<scalar_t>(),
             nangles,
