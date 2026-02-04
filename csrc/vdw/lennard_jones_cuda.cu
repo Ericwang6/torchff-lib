@@ -58,25 +58,33 @@ __global__ void lennard_jones_cuda_kernel(
     else {
         scalar_t rinv = 1 / tmp[0];
 
-        scalar_t sigma_ij = (sigma[i] + sigma[j]) / 2;
-        scalar_t epsilon_ij = sqrt_(epsilon[i] * epsilon[j]);
+        const scalar_t ei = epsilon[i];
+        const scalar_t ej = epsilon[j];
+        const scalar_t si = sigma[i];
+        const scalar_t sj = sigma[j];
+        const scalar_t sij = (si + sj) / 2;
+        const scalar_t eij = sqrt_(ei * ej);
 
-        scalar_t sigma_ij_6 = pow(sigma_ij, 6);
-        scalar_t rinv6 = pow(rinv, 6);
+        scalar_t s2 = sij * sij;
+        scalar_t rinv2 = rinv * rinv;
 
-        tmp[0] = 4 * epsilon_ij * sigma_ij_6 * (sigma_ij_6 * rinv6 * rinv6 - rinv6);
+        scalar_t sij_6 = s2 * s2 * s2;
+        scalar_t rinv6 = rinv2 * rinv2 * rinv2;
+
+        tmp[0] = 4 * eij * sij_6 * rinv6 * (sij_6 * rinv6 - 1);
         ene[index] = tmp[0];
 
-        atomicAdd(&epsilon_grad[i], tmp[0] / 2 / epsilon[i]);
-        atomicAdd(&epsilon_grad[j], tmp[0] / 2 / epsilon[j]);
+        atomicAdd(&epsilon_grad[i], tmp[0] / 2 / ei);
+        atomicAdd(&epsilon_grad[j], tmp[0] / 2 / ej);
         
-        tmp[0] = 24 * epsilon_ij * sigma_ij_6 * (2 * sigma_ij_6 * rinv6 * rinv6 - rinv6);
-        scalar_t sigma_deriv = tmp[0] / 2 / sigma_ij;
+        tmp[0] = 24 * eij * sij_6 * rinv6 * (2 * sij_6 * rinv6 - 1);
+        scalar_t sigma_deriv = tmp[0] / 2 / sij;
         atomicAdd(&sigma_grad[i], sigma_deriv);
         atomicAdd(&sigma_grad[j], sigma_deriv);
 
-        tmp[0] = tmp[0] * rinv * rinv;
+        tmp[0] = tmp[0] * rinv2;
         scalar_t g;
+        #pragma unroll
         for (int i = 0; i < 3; i++) {
             g = tmp[0] * rij[i];
             atomicAdd(&coord_grad[offset_i + i], -g);
