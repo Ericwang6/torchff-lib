@@ -21,10 +21,14 @@ def build_cluster_pairs(
     cell_size: float = 0.4,
     max_num_interacting_clusters: int = -1
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if exclusions is None:
-        exclusions = torch.full((coords.shape[0], 1), -1, dtype=torch.int32, device=coords.device)
     
-    sorted_atom_indices, interacting_clusters, bitmask_exclusions, num_interacting_clusters = torch.ops.torchff.build_cluster_pairs(
+    (
+        sorted_atom_indices,
+        cluster_exclusions,
+        bitmask_exclusions,
+        interacting_clusters,
+        interacting_atoms
+    ) = torch.ops.torchff.build_cluster_pairs(
         coords,
         box,
         cutoff,
@@ -33,26 +37,37 @@ def build_cluster_pairs(
         max_num_interacting_clusters
     )
     return (
-        sorted_atom_indices, interacting_clusters, 
-        bitmask_exclusions, num_interacting_clusters
+        sorted_atom_indices,
+        cluster_exclusions,
+        bitmask_exclusions,
+        interacting_clusters,
+        interacting_atoms
     )
 
 
 def decode_cluster_pairs(
     coords: torch.Tensor, 
     box: torch.Tensor,
-    sorted_atom_indices: torch.Tensor,
-    interacting_clusters: torch.Tensor,
-    bitmask_exclusions: torch.Tensor,
+    sorted_atom_indices,
+    cluster_exclusions,
+    bitmask_exclusions,
+    interacting_clusters,
+    interacting_atoms,
     cutoff: float,
     max_npairs: int = -1,
-    num_interacting_clusters: int = -1,
     padding: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     return torch.ops.torchff.decode_cluster_pairs(
-        coords, box, 
-        sorted_atom_indices, interacting_clusters, bitmask_exclusions,
-        cutoff, max_npairs, num_interacting_clusters, padding
+        coords, 
+        box,
+        sorted_atom_indices,
+        cluster_exclusions,
+        bitmask_exclusions,
+        interacting_clusters,
+        interacting_atoms,
+        cutoff,
+        max_npairs,
+        padding
     )
 
 
@@ -60,23 +75,98 @@ def build_neighbor_list_cluster_pairs(
     coords: torch.Tensor,
     box: torch.Tensor,
     cutoff: float,
-    exclusions: Optional[torch.Tensor] = None,
+    exclusions: Optional[torch.Tensor],
     cell_size: float = 0.45,
     max_num_interacting_clusters: int = -1,
     max_npairs: int = -1,
     padding: bool = False
 ):
-    sorted_atom_indices, interacing_clusters, bitmask_exclusions, num_interacting_clusters = build_cluster_pairs(
+    nblist = build_cluster_pairs(
         coords, box,
         cutoff, exclusions,
         cell_size, max_num_interacting_clusters
     )
-    # print(interacing_clusters)
-    # print(bitmask_exclusions)
-    # print("Found number of interacting clusters:", num_interacting_clusters.item())
+    # sorted_atom_indices = nblist[0].detach().cpu().numpy().tolist()
+    # print("Atom 137 in cluster", sorted_atom_indices.index(137)//32)
+    # print("Atom 145 in cluster", sorted_atom_indices.index(145)//32)
+    # for x, atoms in zip(nblist[-2].detach().cpu().numpy().tolist(), nblist[-1].detach().cpu().numpy().tolist()):
+    #     print(x, atoms)
+    # print(nblist[1].shape)
+    for nl in nblist:
+        print(nl.shape)
+    print(nblist[-1][:5])
     return decode_cluster_pairs(
-        coords, box, sorted_atom_indices, interacing_clusters,
-        bitmask_exclusions, cutoff,
-        max_npairs, num_interacting_clusters.item(),
-        padding
+        coords, box, *nblist, cutoff,
+        max_npairs, padding
     )
+
+
+
+# def build_cluster_pairs(
+#     coords: torch.Tensor, box: torch.Tensor,
+#     cutoff: float, 
+#     exclusions: Optional[torch.Tensor] = None,
+#     cell_size: float = 0.4,
+#     max_num_interacting_clusters: int = -1
+# ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+#     if exclusions is None:
+#         exclusions = torch.full((coords.shape[0], 1), -1, dtype=torch.int32, device=coords.device)
+    
+#     sorted_atom_indices, interacting_clusters, bitmask_exclusions, num_interacting_clusters = torch.ops.torchff.build_cluster_pairs(
+#         coords,
+#         box,
+#         cutoff,
+#         exclusions,
+#         cell_size,
+#         max_num_interacting_clusters
+#     )
+#     return (
+#         sorted_atom_indices, interacting_clusters, 
+#         bitmask_exclusions, num_interacting_clusters
+#     )
+
+
+# def decode_cluster_pairs(
+#     coords: torch.Tensor, 
+#     box: torch.Tensor,
+#     sorted_atom_indices: torch.Tensor,
+#     interacting_clusters: torch.Tensor,
+#     bitmask_exclusions: torch.Tensor,
+#     cutoff: float,
+#     max_npairs: int = -1,
+#     num_interacting_clusters: int = -1,
+#     padding: bool = False
+# ) -> Tuple[torch.Tensor, torch.Tensor]:
+#     return torch.ops.torchff.decode_cluster_pairs(
+#         coords, box, 
+#         sorted_atom_indices, interacting_clusters, bitmask_exclusions,
+#         cutoff, max_npairs, num_interacting_clusters, padding
+#     )
+
+
+# def build_neighbor_list_cluster_pairs(
+#     coords: torch.Tensor,
+#     box: torch.Tensor,
+#     cutoff: float,
+#     exclusions: Optional[torch.Tensor] = None,
+#     cell_size: float = 0.45,
+#     max_num_interacting_clusters: int = -1,
+#     max_npairs: int = -1,
+#     padding: bool = False
+# ):
+#     sorted_atom_indices, interacing_clusters, bitmask_exclusions, num_interacting_clusters = build_cluster_pairs(
+#         coords, box,
+#         cutoff, exclusions,
+#         cell_size, max_num_interacting_clusters
+#     )
+#     # print(interacing_clusters)
+#     # print(bitmask_exclusions)
+#     # print("Found number of interacting clusters:", num_interacting_clusters.item())
+#     return decode_cluster_pairs(
+#         coords, box, sorted_atom_indices, interacing_clusters,
+#         bitmask_exclusions, cutoff,
+#         max_npairs, num_interacting_clusters.item(),
+#         padding
+#     )
+
+

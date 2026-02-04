@@ -7,7 +7,7 @@ import torch
 
 def check_op(
     func: Callable, ref_func: Callable, args: Dict[str, Any], 
-    check_grad: bool = True, atol: float = 1e-8, rtol: float = 1e-5
+    check_grad: bool = True, atol: float = 1e-8, rtol: float = 1e-5, verbose: bool = False
 ):
     prb = func(**args)
     prb_grads = {}
@@ -27,11 +27,15 @@ def check_op(
                 ref_grads[k] = v
                 v.grad.zero_()
     
+    if verbose:
+        print(f"Ref: {ref} vs Prb: {prb}")
     assert torch.allclose(ref, prb, atol=atol, rtol=rtol), f"Function value not the same: {ref.cpu().item():.5f} != {prb.cpu().item()}"
     if check_grad:
         for arg_name in prb_grads:
             ref_grad, prb_grad = ref_grads[arg_name], prb_grads[arg_name]
-            assert torch.allclose(ref_grad, prb_grad, atol=atol, rtol=rtol), arg_name + f'gradient not the same, max deviation {torch.max(torch.abs(ref_grad - prb_grad))}, Ref: {ref_grad}, Prb: {prb_grad}'
+            if verbose:
+                print(arg_name, ref_grad, prb_grad)
+            assert torch.allclose(ref_grad, prb_grad, atol=atol, rtol=rtol), arg_name + f'gradient not the same for {arg_name}, max deviation {torch.max(torch.abs(ref_grad - prb_grad))}, Ref: {ref_grad}, Prb: {prb_grad}'
 
 
 def perf_op(func, *args, desc='perf_op', warmup=10, repeat=1000, run_backward=False, use_cuda_graph=False, explicit_sync=True):
@@ -97,6 +101,7 @@ def perf_op(func, *args, desc='perf_op', warmup=10, repeat=1000, run_backward=Fa
     
     perf = np.array(perf) * 1000  # in ms
     print(f"{desc} - Time: {np.mean(perf):.4f} +/- {np.std(perf):.4f} ms (use_cuda_graph = {use_cuda_graph}, run_backward = {run_backward}, explicit_sync = {explicit_sync})")
+    return perf
 
 
 @pytest.mark.parametrize("run_backward", [True, False])

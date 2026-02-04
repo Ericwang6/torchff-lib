@@ -5,544 +5,633 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/library.h>
-#include <cuda.h>
-#include <cuda_runtime.h>
-#include <math_constants.h>
-#include <vector>
-#include <tuple>
-#include <iostream>
-#include <iomanip>
 
-#ifndef C10_CUDA_KERNEL_LAUNCH_CHECK
-#define C10_CUDA_KERNEL_LAUNCH_CHECK()
-#endif
+#include "kernels.cuh"
 
-// ========================= DEBUG CONTROLS =========================
-#ifndef EWALD_DBG
-#define EWALD_DBG 0
-#endif
 
-// Device-safe numeric helpers
-__device__ __forceinline__ double d_twopi()       { return 2.0 * CUDART_PI; }
-__device__ __forceinline__ double d_twopi2()      { double t = d_twopi(); return t*t; }
-__device__ __forceinline__ double d_twopi2_over3(){ return d_twopi2() / 3.0; }
-#define INV_ROOT_PI 0.56418958354
+class EwaldEnergyFunctionCuda : public torch::autograd::Function<EwaldEnergyFunctionCuda> {
 
-// ============================================================================
-// KERNEL 1: PREPARE K-CONSTANTS (HKL + KROW_OPS)
-// ============================================================================
-template <typename T>
-__global__ void prepare_k_constants_kernel(
-    int K, T alpha, size_t M1,
-    const T* __restrict__ recip, // (3,3)
-    T* __restrict__ kvec,        // (3,M1) out
-    T* __restrict__ gaussian,    // (M1) out
-    T* __restrict__ sym)         // (M1) out
-{
-    const int R = 2*K + 1;
-    const size_t M  = (size_t)(K+1)*R*R;
-    const size_t i0 = (size_t)K*R + K;
+public:
 
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    if (idx >= M || idx == i0) return;
-
-    // 1. Decode Linear Index to H,K,L
-    const int lIdx =  idx % R;
-    const int kIdx = (idx / R) % R;
-    const int hIdx =  idx / (R*R);
-    
-    const int h  = hIdx;
-    const int kk = kIdx - K;
-    const int kl = lIdx - K;
-    
-    // Safety check for (0,0,0) although idx==i0 usually catches it
-    if (h==0 && kk==0 && kl==0) return;
-
-    // 2. Map to output index j (0..M1-1)
-    const size_t j = (idx < i0) ? idx : (idx - 1);
-
-    // 3. Compute K-Vector (k = recip * hkl)
-    // hkl vector is (h, kk, kl)
-    // kvec_x = recip[0]*h + recip[1]*kk + recip[2]*kl
-    T kx = recip[0]*h + recip[1]*kk + recip[2]*kl;
-    T ky = recip[3]*h + recip[4]*kk + recip[5]*kl;
-    T kz = recip[6]*h + recip[7]*kk + recip[8]*kl;
-
-    kvec[0*M1 + j] = kx;
-    kvec[1*M1 + j] = ky;
-    kvec[2*M1 + j] = kz;
-
-    // 4. Compute Gaussian and Sym
-    const T k2v = kx*kx + ky*ky + kz*kz;
-    const T num = -(CUDART_PI * CUDART_PI * k2v) / (alpha*alpha);
-    gaussian[j] = exp(num) / k2v;
-    sym[j] = (h > 0) ? T(2) : T(1);
-}
-
-// Small helper for reciprocal box
-template <typename T>
-__global__ void reciprocal_box_kernel(const T* box, T* recip, T V) {
-  if (threadIdx.x == 0) {
-    const T b1x=box[0], b1y=box[3], b1z=box[6];
-    const T b2x=box[1], b2y=box[4], b2z=box[7];
-    const T b3x=box[2], b3y=box[5], b3z=box[8];
-    const T invV = T(1)/V;
-    recip[0]=(b2y*b3z - b2z*b3y)*invV; recip[3]=(b3y*b1z - b3z*b1y)*invV; recip[6]=(b1y*b2z - b1z*b2y)*invV;
-    recip[1]=(b2z*b3x - b2x*b3z)*invV; recip[4]=(b3z*b1x - b3x*b1z)*invV; recip[7]=(b1z*b2x - b1x*b2z)*invV;
-    recip[2]=(b2x*b3y - b2y*b3x)*invV; recip[5]=(b3x*b1y - b3y*b1x)*invV; recip[8]=(b1x*b2y - b1y*b2x)*invV;
-  }
-}
-
-// ============================================================================
-// KERNEL 2: STRUCTURE FACTOR
-// ============================================================================
-// Merges: Phase calculation + S(k) accumulation.
-template <typename T>
-__global__ void compute_structure_factor_fused(
-    int64_t M1, int64_t N,
-    const T* __restrict__ kvec,                // (3, M1)
-    const T* __restrict__ coords,              // (N, 3)
-    const T* __restrict__ q,                   // (N)
-    const T* __restrict__ p,                   // (N, 3) or null
-    const T* __restrict__ t,                   // (N, 9) or null
-    int rank,
-    T* __restrict__ Sreal,                     // (M1) Out
-    T* __restrict__ Simag)                     // (M1) Out
-{
-    const int k = blockIdx.x; // One block per k-vector
-    if (k >= M1) return;
-
-    const T kx = kvec[0*M1 + k];
-    const T ky = kvec[1*M1 + k];
-    const T kz = kvec[2*M1 + k];
-
-    const T twopi    = (T)d_twopi();
-    const T twopi2o3 = (T)d_twopi2_over3();
-
-    T acc_r = T(0);
-    T acc_i = T(0);
-
-    // Grid-stride loop over atoms (if N > blockDim)
-    for (int64_t n = threadIdx.x; n < N; n += blockDim.x) {
-        
-        // 1. Phase Calculation
-        const T rx = coords[n*3+0];
-        const T ry = coords[n*3+1];
-        const T rz = coords[n*3+2];
-        const T theta = twopi * (kx*rx + ky*ry + kz*rz);
-        T s, c;
-        sincos(theta, &s, &c);
-
-        // 2. Multipole Charge L_n(k)
-        T F_r = q[n];
-        T F_i = T(0);
-	   // Dipole term
-        if (rank >= 1 && p) {
-            const T px = p[3*n + 0], py = p[3*n + 1], pz = p[3*n + 2];
-            F_i = twopi * (kx*px + ky*py + kz*pz);
-        }
-        if (rank >= 2 && t) {
-            const T* tn = &t[n*9];
-            // Quadrupole term
-            const T tkx = tn[0]*kx + tn[1]*ky + tn[2]*kz;
-            const T tky = tn[3]*kx + tn[4]*ky + tn[5]*kz;
-            const T tkz = tn[6]*kx + tn[7]*ky + tn[8]*kz;
-            const T ktk = kx*tkx + ky*tky + kz*tkz;
-            F_r -= twopi2o3 * ktk; 
-        }
-
-        // 3. Complex Multiply: (Fr + iFi) * (c + is)
-        acc_r += (F_r*c - F_i*s);
-        acc_i += (F_r*s + F_i*c);
-    }
-
-    __shared__ T s_r[256], s_i[256];
-    const int tid = threadIdx.x;
-    s_r[tid] = acc_r; 
-    s_i[tid] = acc_i;
-    __syncthreads();
-
-    for (int stride = blockDim.x>>1; stride>0; stride>>=1) {
-        if (tid < stride) { 
-            s_r[tid]+=s_r[tid+stride]; 
-            s_i[tid]+=s_i[tid+stride]; 
-        }
-        __syncthreads();
-    }
-
-    if (tid==0) {
-        Sreal[k] = s_r[0];
-        Simag[k] = s_i[0];
-    }
-}
-
-// ============================================================================
-// KERNEL 3: MAIN
-// ============================================================================
-// Merges: Accumulation, Operator Forces, Energy, and Self-Terms.
-template <typename T>
-__global__ void compute_ewald_dynamics_fused(
-    int64_t M1, int64_t N, T V, double alpha,
-    const T* __restrict__ kvec,                   // (3,M1)
-    const T* __restrict__ gaussian,               // (M1)
-    const T* __restrict__ sym,                    // (M1)
-    const T* __restrict__ Sreal,                  // (M1)
-    const T* __restrict__ Simag,                  // (M1)
-    const T* __restrict__ coords,                 // (N,3)
-    const T* __restrict__ q,                      // (N)
-    const T* __restrict__ p,                      // (N,3)
-    const T* __restrict__ Q,                      // (N,9)
-    int rank,
-    T* __restrict__ pot_out,                      // (N)
-    T* __restrict__ field_out,                    // (N,3)
-    T* __restrict__ grad_out,                     // (N,9)
-    T* __restrict__ force_out,                    // (N,3)
-    T* __restrict__ total_energy_out)             // (1)
-{
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    T local_energy_contribution = T(0);
-
-    if (i < N) {
-        // --- CONSTANTS ---
-        const T invV     = T(1) / V;
-        const T pref_pot = invV / T(CUDART_PI);        
-        const T pref_fld = -T(2) * invV;               
-        const T pref_grd = T(4) * T(CUDART_PI) * invV; 
-        const T force_pref = T(-2.0) / V;
-        const T twopi = (T)d_twopi();
-        const T twopi2o3 = (T)d_twopi2_over3();
-
-        // --- LOAD ATOM i ---
-        const T ri_x = coords[i*3+0];
-        const T ri_y = coords[i*3+1];
-        const T ri_z = coords[i*3+2];
-        const T qi   = q[i];
-        
-        T p_x=0, p_y=0, p_z=0;
-        if (rank >= 1 && p) { p_x=p[3*i+0]; p_y=p[3*i+1]; p_z=p[3*i+2]; }
-        
-        // --- ACCUMULATORS ---
-        T sum_pot = 0;
-        T sum_fx = 0, sum_fy = 0, sum_fz = 0; // Field
-        // Gradient accumulators
-        T g00=0,g01=0,g02=0, g10=0,g11=0,g12=0, g20=0,g21=0,g22=0;
-        // Force accumulators
-        T force_x = 0, force_y = 0, force_z = 0;
-
-        // --- K-VECTOR LOOP ---
-        for (int64_t k = 0; k < M1; ++k) {
-            const T kx = kvec[0*M1 + k];
-            const T ky = kvec[1*M1 + k];
-            const T kz = kvec[2*M1 + k];
-            const T w  = gaussian[k] * sym[k];
-            
-            // Phase
-            const T theta = twopi * (kx*ri_x + ky*ri_y + kz*ri_z);
-            T si, ci; 
-            sincos(theta, &si, &ci);
-
-            const T Sr = Sreal[k];
-            const T Si = Simag[k];
-
-            // 1. RE/IM PARTS for Pot/Field
-            // Re[S e^{-i theta}] = Sr*c + Si*s
-            // Im[S e^{-i theta}] = -Sr*s + Si*c
-            const T realp = Sr*ci + Si*si;     
-            const T imagp = -Sr*si + Si*ci;    
-
-            sum_pot += w * realp;
-            
-            // Field
-            sum_fx += w * imagp * kx;
-            sum_fy += w * imagp * ky;
-            sum_fz += w * imagp * kz;
-
-            // Gradient)
-            if (rank >= 1) { 
-                 const T rr = w * realp;
-                 g00 += rr*kx*kx; g01 += rr*kx*ky; g02 += rr*kx*kz;
-                 g10 += rr*ky*kx; g11 += rr*ky*ky; g12 += rr*ky*kz;
-                 g20 += rr*kz*kx; g21 += rr*kz*ky; g22 += rr*kz*kz;
-            }
-
-            // 2. Forces
-            // L_i(k) terms
-            T Lr = qi;
-            T Li = T(0);
-            if (rank >= 1) Li -= twopi * (kx*p_x + ky*p_y + kz*p_z);
-            if (rank >= 2 && Q) {
-                const T* Qi = &Q[9*i];
-                const T tkx = Qi[0]*kx + Qi[1]*ky + Qi[2]*kz;
-                const T tky = Qi[3]*kx + Qi[4]*ky + Qi[5]*kz;
-                const T tkz = Qi[6]*kx + Qi[7]*ky + Qi[8]*kz;
-                Lr -= twopi2o3 * (kx*tkx + ky*tky + kz*tkz);
-            }
-
-            // Formula: Im{ e^{-i theta} * conj(L) * S }
-            // conj(L) = Lr - i*Li 
-            // Term = (ci - i*si) * (Lr - i*Li) * (Sr + i*Si)
-            const T real_LS = Lr*Sr - Li*Si;
-            const T imag_LS = Lr*Si + Li*Sr;
-            const T Im_eL_S = ci * imag_LS - si * real_LS;
-
-            const T scale = force_pref * w * Im_eL_S;
-            force_x += scale * kx;
-            force_y += scale * ky;
-            force_z += scale * kz;
-        }
-
-        const T a_over_rpi = alpha * INV_ROOT_PI;
-        
-        // Potential
-        T final_pot = pref_pot * sum_pot;
-        final_pot += (-2.0 * a_over_rpi * qi); // Self
-        pot_out[i] = final_pot;
-
-        // Field
-        T final_Ex = pref_fld * sum_fx;
-        T final_Ey = pref_fld * sum_fy;
-        T final_Ez = pref_fld * sum_fz;
-        
-        if (rank >= 1 && p) {
-            const T self_fld = a_over_rpi * (4.0*alpha*alpha/3.0);
-            final_Ex += p_x * self_fld;
-            final_Ey += p_y * self_fld;
-            final_Ez += p_z * self_fld;
-        }
-        field_out[3*i+0] = final_Ex;
-        field_out[3*i+1] = final_Ey;
-        field_out[3*i+2] = final_Ez;
-
-        // Gradient
-        T G00=pref_grd*g00, G01=pref_grd*g01, G02=pref_grd*g02;
-        T G10=pref_grd*g10, G11=pref_grd*g11, G12=pref_grd*g12;
-        T G20=pref_grd*g20, G21=pref_grd*g21, G22=pref_grd*g22;
-        
-        if (rank >= 2 && Q) {
-            const T self_grd = a_over_rpi * (16.0*alpha*alpha*alpha*alpha/15.0);
-            const T* Qi = &Q[9*i];
-            G00 += Qi[0]*self_grd; G01 += Qi[1]*self_grd; G02 += Qi[2]*self_grd;
-            G10 += Qi[3]*self_grd; G11 += Qi[4]*self_grd; G12 += Qi[5]*self_grd;
-            G20 += Qi[6]*self_grd; G21 += Qi[7]*self_grd; G22 += Qi[8]*self_grd;
-        }
-        
-        T* G_out = &grad_out[9*i];
-        G_out[0]=G00; G_out[1]=G01; G_out[2]=G02;
-        G_out[3]=G10; G_out[4]=G11; G_out[5]=G12;
-        G_out[6]=G20; G_out[7]=G21; G_out[8]=G22;
-
-        // Forces
-        force_out[3*i+0] = force_x;
-        force_out[3*i+1] = force_y;
-        force_out[3*i+2] = force_z;
-
-        // Local Energy Calculation
-        // E_local = 0.5 * ( q*phi - p.E - (1/3) * Q : gradE )
-        T term_q = qi * final_pot;
-        T term_p = 0; 
-        if (rank >= 1) term_p = p_x*final_Ex + p_y*final_Ey + p_z*final_Ez;
-        T term_Q = 0;
-        if (rank >= 2 && Q) {
-            const T* Qi = &Q[9*i];
-            term_Q = Qi[0]*G00 + Qi[1]*G01 + Qi[2]*G02 +
-                     Qi[3]*G10 + Qi[4]*G11 + Qi[5]*G12 +
-                     Qi[6]*G20 + Qi[7]*G21 + Qi[8]*G22;
-        }
-        local_energy_contribution = 0.5 * (term_q - term_p - term_Q/3.0);
-    }
-
-    __shared__ T ssum[256];
-    const int tid = threadIdx.x;
-    ssum[tid] = local_energy_contribution;
-    __syncthreads();
-
-    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) ssum[tid] += ssum[tid + stride];
-        __syncthreads();
-    }
-    if (tid == 0) {
-        atomicAdd(total_energy_out, ssum[0]);
-    }
-}
-
-struct EwaldLongRangeAllFunctionCuda : public torch::autograd::Function<EwaldLongRangeAllFunctionCuda> {
-  static torch::autograd::variable_list forward(
-      torch::autograd::AutogradContext* ctx,
-      at::Tensor coords, at::Tensor box, at::Tensor q, at::Tensor p, at::Tensor t,
-      at::Tensor K_t, at::Tensor rank_t, at::Tensor alpha_t) {
-
-    int64_t K   = K_t.item<int64_t>();
-    int64_t rank= rank_t.item<int64_t>();
-    double alpha= alpha_t.item<double>();
+static at::Tensor forward(
+    torch::autograd::AutogradContext* ctx,
+    at::Tensor& coords, 
+    at::Tensor& box, 
+    at::Tensor& q, 
+    c10::optional<at::Tensor>& p, 
+    c10::optional<at::Tensor>& t,
+    at::Scalar k_max,  
+    at::Scalar alpha
+) {
 
     at::cuda::CUDAGuard guard(coords.device());
     auto stream = at::cuda::getCurrentCUDAStream();
     auto opts = coords.options();
+
+    const int64_t K = k_max.toLong();
     const int64_t N = coords.size(0);
 
-    // 1. Host side volume and box copy
-    double h_box[9];
-    auto box_c = box.contiguous().cpu();
-    memcpy(h_box, box_c.data_ptr<double>(), 9*sizeof(double));
-    double V = h_box[0]*(h_box[4]*h_box[8]-h_box[5]*h_box[7]) - h_box[1]*(h_box[3]*h_box[8]-h_box[5]*h_box[6]) + h_box[2]*(h_box[3]*h_box[7]-h_box[4]*h_box[6]);
-
-    // 2. Prepare Constants
-    auto recip = at::empty({3,3}, opts);
-    reciprocal_box_kernel<double><<<1,1,0,stream>>>(box.data_ptr<double>(), recip.data_ptr<double>(), V);
-
-    const int R  = 2*int(K) + 1;
-    const int64_t M  = (int64_t)(K+1) * R * R;
-    const int64_t M1 = M - 1;
-
-    auto kvec = at::empty({3, M1}, opts);
-    auto gauss = at::empty({M1}, opts);
-    auto sym   = at::empty({M1}, opts);
-
-    {
-        dim3 block(256), grid((unsigned)((M + block.x - 1)/block.x));
-        prepare_k_constants_kernel<double><<<grid, block, 0, stream>>>(
-            (int)K, (double)alpha, (size_t)M1,
-            recip.data_ptr<double>(),
-            kvec.data_ptr<double>(),
-            gauss.data_ptr<double>(),
-            sym.data_ptr<double>()
-        );
+    // Determine rank from optional tensors
+    int64_t rank = 0;
+    if (t.has_value()) {
+        rank = 2;
+    } else if (p.has_value()) {
+        rank = 1;
     }
+    const double Vd = at::det(box).item<double>();
 
-    // 3. Structure Factor
-    auto Sreal = at::zeros({M1}, opts);
-    auto Simag = at::zeros({M1}, opts);
-    {
-        dim3 grid((unsigned)M1);
-        dim3 block(256);
-        compute_structure_factor_fused<double><<<grid, block, 0, stream>>>(
-            M1, N,
-            kvec.data_ptr<double>(),
-            coords.data_ptr<double>(),
-            q.data_ptr<double>(),
-            (rank>=1 && p.defined()) ? p.data_ptr<double>() : nullptr,
-            (rank>=2 && t.defined()) ? t.reshape({N,9}).data_ptr<double>() : nullptr,
-            (int)rank,
-            Sreal.data_ptr<double>(),
-            Simag.data_ptr<double>()
-        );
-    }
-
-    // 4. (Pot++, Forces, Energy)
+    // Prepare output tensors
+    const int64_t M = K * ( K * (4*K+6) + 3 );
+    auto kvec = at::empty({4, M}, opts);
+    auto Sreal = at::zeros({M}, opts);
+    auto Simag = at::zeros({M}, opts);
     auto pot = at::zeros({N}, opts);
     auto field = at::zeros({N,3}, opts);
-    auto grad = at::zeros({N,9}, opts);
+    auto field_grad = at::zeros({N,3,3}, opts);
     auto forces = at::zeros({N,3}, opts);
     auto energy = at::zeros({}, opts);
 
-    {
-        dim3 block(256);
-        dim3 grid((unsigned)((N + block.x - 1)/block.x));
-        compute_ewald_dynamics_fused<double><<<grid, block, 0, stream>>>(
-            M1, N, V, alpha,
-            kvec.data_ptr<double>(),
-            gauss.data_ptr<double>(), sym.data_ptr<double>(),
-            Sreal.data_ptr<double>(), Simag.data_ptr<double>(),
-            coords.data_ptr<double>(),
-            q.data_ptr<double>(),
-            (rank>=1 && p.defined()) ? p.data_ptr<double>() : nullptr,
-            (rank>=2 && t.defined()) ? t.reshape({N,9}).data_ptr<double>() : nullptr,
-            (int)rank,
-            pot.data_ptr<double>(),
-            field.data_ptr<double>(),
-            grad.data_ptr<double>(),
-            forces.data_ptr<double>(),
-            energy.data_ptr<double>()
+    ctx->saved_data["rank"] = rank;
+    ctx->saved_data["alpha"] = alpha;
+    ctx->saved_data["K"] = K;
+    ctx->saved_data["Vd"] = Vd;
+    ctx->saved_data["N"] = N;
+    ctx->saved_data["M"] = M;
+
+    // Reciprocal lattice vectors and box volume
+    at::Tensor recip = at::linalg_inv(box);
+
+    AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "ewald_forward", ([&] {
+        const scalar_t alpha_val = static_cast<scalar_t>(alpha.toDouble());
+        const scalar_t V = static_cast<scalar_t>(Vd);
+
+        // 1. Prepare k-vectors
+        constexpr int BLOCK_SIZE_KVECS = 256;
+        const int GRID_SIZE_KVECS = (M + BLOCK_SIZE_KVECS - 1) / BLOCK_SIZE_KVECS;
+        prepare_k_constants_kernel<scalar_t><<<GRID_SIZE_KVECS, BLOCK_SIZE_KVECS, 0, stream>>>(
+            K, alpha_val,
+            recip.data_ptr<scalar_t>(),
+            kvec.data_ptr<scalar_t>()
         );
-    }
 
-    // Reshape grad to (N,3,3)
-    at::Tensor grad_reshaped = grad.reshape({N,3,3});
+        // 2. Forward 
+        const int GRID_SIZE_FWD = M;
+        constexpr int BLOCK_SIZE = 256;
+        if (rank == 0) {
+            compute_self_contribution_kernel_rank_0<scalar_t><<<GRID_SIZE_FWD, BLOCK_SIZE, 0, stream>>>(
+                q.data_ptr<scalar_t>(), N, alpha_val,
+                energy.data_ptr<scalar_t>(),
+                pot.data_ptr<scalar_t>()
+            );
+            ewald_forward_kernel<scalar_t, 0><<<GRID_SIZE_FWD, BLOCK_SIZE, 0, stream>>>(
+                kvec.data_ptr<scalar_t>(),
+                coords.data_ptr<scalar_t>(),
+                q.data_ptr<scalar_t>(),
+                nullptr,
+                nullptr,
+                M, N, V,
+                Sreal.data_ptr<scalar_t>(),
+                Simag.data_ptr<scalar_t>(),
+                energy.data_ptr<scalar_t>()
+            );
+        } else if (rank == 1) {
+            compute_self_contribution_kernel_rank_1<scalar_t><<<GRID_SIZE_FWD, BLOCK_SIZE, 0, stream>>>(
+                q.data_ptr<scalar_t>(), p->data_ptr<scalar_t>(),
+                N, alpha_val,
+                energy.data_ptr<scalar_t>(),
+                pot.data_ptr<scalar_t>(),
+                field.data_ptr<scalar_t>()
+            );
+            ewald_forward_kernel<scalar_t, 1><<<GRID_SIZE_FWD, BLOCK_SIZE, 0, stream>>>(
+                kvec.data_ptr<scalar_t>(),
+                coords.data_ptr<scalar_t>(),
+                q.data_ptr<scalar_t>(),
+                p->data_ptr<scalar_t>(),
+                nullptr,
+                M, N, V,
+                Sreal.data_ptr<scalar_t>(),
+                Simag.data_ptr<scalar_t>(),
+                energy.data_ptr<scalar_t>()
+            );
+        } else {
+            compute_self_contribution_kernel_rank_2<scalar_t><<<GRID_SIZE_FWD, BLOCK_SIZE, 0, stream>>>(
+                q.data_ptr<scalar_t>(), p->data_ptr<scalar_t>(), t->data_ptr<scalar_t>(),
+                N, alpha_val,
+                energy.data_ptr<scalar_t>(),
+                pot.data_ptr<scalar_t>(),
+                field.data_ptr<scalar_t>(),
+                field_grad.data_ptr<scalar_t>()
+            );
+            ewald_forward_kernel<scalar_t, 2><<<GRID_SIZE_FWD, BLOCK_SIZE, 0, stream>>>(
+                kvec.data_ptr<scalar_t>(),
+                coords.data_ptr<scalar_t>(),
+                q.data_ptr<scalar_t>(),
+                p->data_ptr<scalar_t>(),
+                t->data_ptr<scalar_t>(),
+                M, N, V,
+                Sreal.data_ptr<scalar_t>(),
+                Simag.data_ptr<scalar_t>(),
+                energy.data_ptr<scalar_t>()
+            );
+        }
+    }));
+        
+    // save for backward pass
+    at::Tensor p_saved = p.has_value() ? p.value() : at::Tensor();
+    at::Tensor t_saved = t.has_value() ? t.value() : at::Tensor();
+    ctx->save_for_backward({
+        coords, box, q, p_saved, t_saved, 
+        kvec, Sreal, Simag, forces, pot, field, field_grad});
 
-    // --- CRITICAL CHANGE: SAVE MORE TENSORS ---
-    // We need 'field' (for d_p), 'grad_reshaped' (for d_t and cross-force), and 'rank_t'.
-    ctx->save_for_backward({forces, field, grad_reshaped, rank_t});
+    return energy;
+}
 
-    // Prepare output list
-    torch::autograd::variable_list out(5);
-    out[0] = pot;
-    out[1] = field;
-    out[2] = grad_reshaped;
-    out[3] = energy;
-    out[4] = forces;
-    return out;
-  }
-
-  static torch::autograd::variable_list backward(
-      torch::autograd::AutogradContext* ctx,
-      torch::autograd::variable_list grad_outputs) {
-
-    // grad_outputs: [g_potential, g_field, g_grad, g_energy, g_forces]
-    const at::Tensor& g_field  = grad_outputs[1]; // Gradient from Field coupling (Polarization)
-    const at::Tensor& g_energy = grad_outputs[3]; // Gradient from Energy (Scalar)
-
-    // Retrieve saved tensors
+static torch::autograd::variable_list backward(
+    torch::autograd::AutogradContext* ctx,
+    torch::autograd::variable_list grad_outputs
+) {
+    // Retrieve saved tensors: {coords, box, q, p_saved, t_saved, kvec, Sreal, Simag, forces, pot, field, field_grad}
     auto saved = ctx->get_saved_variables();
-    const at::Tensor& forces_internal = saved[0]; // (N,3)
-    const at::Tensor& field           = saved[1]; // (N,3)
-    const at::Tensor& field_grad      = saved[2]; // (N,3,3)
-    const at::Tensor& rank_t          = saved[3]; // Scalar Tensor
+    at::Tensor coords = saved[0];
+    at::Tensor box = saved[1];
+    at::Tensor q = saved[2];
+    at::Tensor p_saved = saved[3];
+    at::Tensor t_saved = saved[4];
+    at::Tensor kvec = saved[5];
+    at::Tensor Sreal = saved[6];
+    at::Tensor Simag = saved[7];
+    at::Tensor forces = saved[8];
+    at::Tensor pot = saved[9];
+    at::Tensor field = saved[10];
+    at::Tensor field_grad = saved[11];
 
-    int64_t rank = rank_t.item<int64_t>();
+    // Get gradient w.r.t. energy (scalar)
+    at::Tensor grad_energy = grad_outputs[0];
 
-    // --- 1. Compute d_coords (Forces) ---
-    at::Tensor dcoords = at::zeros_like(forces_internal);
+    int64_t rank = ctx->saved_data["rank"].toInt();
+    int64_t K = ctx->saved_data["K"].toInt();
+    int64_t N = ctx->saved_data["N"].toInt();
+    int64_t M = ctx->saved_data["M"].toInt();
 
-    // Part A: Contribution from Energy (Standard Force)
-    if (g_energy.defined()) {
-      auto scale = (g_energy.dim()==0) ? g_energy.view({1,1}) : g_energy;
-      // Note: "forces_internal" is usually calculated as -dE/dx.
-      // If g_energy is positive, we want the gradient, so -force.
-      dcoords -= scale * forces_internal;
+    at::cuda::CUDAGuard guard(coords.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto opts = coords.options();
+
+    AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "ewald_backward", ([&] {
+        scalar_t alpha = static_cast<scalar_t>(ctx->saved_data["alpha"].toDouble());
+        scalar_t V = static_cast<scalar_t>(ctx->saved_data["Vd"].toDouble());
+        constexpr int BLOCK_SIZE = 256;
+        const int GRID_SIZE_BWD = N;
+
+        // Get pointers for optional tensors (can be null for rank < 1 or rank < 2)
+        const scalar_t* p_ptr = (rank >= 1 && p_saved.defined()) ? p_saved.data_ptr<scalar_t>() : nullptr;
+        const scalar_t* t_ptr = (rank >= 2 && t_saved.defined()) ? t_saved.data_ptr<scalar_t>() : nullptr;
+
+        if (rank == 0) {
+            ewald_backward_kernel<scalar_t, 0, BLOCK_SIZE><<<GRID_SIZE_BWD, BLOCK_SIZE, 0, stream>>>(
+                kvec.data_ptr<scalar_t>(),
+                Sreal.data_ptr<scalar_t>(),
+                Simag.data_ptr<scalar_t>(),
+                coords.data_ptr<scalar_t>(),
+                q.data_ptr<scalar_t>(),
+                nullptr,
+                nullptr,
+                M, N, V, alpha,
+                pot.data_ptr<scalar_t>(),
+                field.data_ptr<scalar_t>(),
+                field_grad.data_ptr<scalar_t>(),
+                forces.data_ptr<scalar_t>()
+            );
+        } else if (rank == 1) {
+            ewald_backward_kernel<scalar_t, 1, BLOCK_SIZE><<<GRID_SIZE_BWD, BLOCK_SIZE, 0, stream>>>(
+                kvec.data_ptr<scalar_t>(),
+                Sreal.data_ptr<scalar_t>(),
+                Simag.data_ptr<scalar_t>(),
+                coords.data_ptr<scalar_t>(),
+                q.data_ptr<scalar_t>(),
+                p_ptr,
+                nullptr,
+                M, N, V, alpha,
+                pot.data_ptr<scalar_t>(),
+                field.data_ptr<scalar_t>(),
+                field_grad.data_ptr<scalar_t>(),
+                forces.data_ptr<scalar_t>()
+            );
+        } else if (rank == 2) {
+            ewald_backward_kernel<scalar_t, 2, BLOCK_SIZE><<<GRID_SIZE_BWD, BLOCK_SIZE, 0, stream>>>(
+                kvec.data_ptr<scalar_t>(),
+                Sreal.data_ptr<scalar_t>(),
+                Simag.data_ptr<scalar_t>(),
+                coords.data_ptr<scalar_t>(),
+                q.data_ptr<scalar_t>(),
+                p_ptr,
+                t_ptr,
+                M, N, V, alpha,
+                pot.data_ptr<scalar_t>(),
+                field.data_ptr<scalar_t>(),
+                field_grad.data_ptr<scalar_t>(),
+                forces.data_ptr<scalar_t>()
+            );
+        }
+    }));
+
+    // Compute gradients:
+    // - dE/dcoords = -forces (forces are -dE/dcoords)
+    // - dE/dq = pot (potential at each atom)
+    // - dE/dp = -field (negative electric field)
+    // - dE/dt = field_grad (field gradient, reshaped appropriately)
+    at::Tensor coords_grad = -grad_energy * forces;
+    at::Tensor q_grad = grad_energy * pot;
+    
+    at::Tensor p_grad, t_grad;
+    if (rank >= 1) {
+        p_grad = -grad_energy * field;
     }
-    // --- 2. Compute d_p (Torque on Dipoles) ---
-    at::Tensor d_p;
-    if (rank >= 1 && g_energy.defined()) {
-         auto scale = (g_energy.dim()==0) ? g_energy : g_energy.view({1,1});
-         // dE/dp = -Field
-         d_p = -field * scale;
+    if (rank >= 2) {
+        // field_grad_grad is (N, 9), need to reshape to (N, 3, 3) if needed, but return as (N, 9)
+        t_grad = -grad_energy * field_grad * (1.0/3.0);
     }
 
-    // --- 3. Compute d_t (Torque on Quadrupoles) ---
-    at::Tensor d_t;
-    if (rank >= 2 && g_energy.defined()) {
-         auto scale = (g_energy.dim()==0) ? g_energy : g_energy.view({1,1,1});
-         // dE/dQ = -1/3 * Gradient(Field)
-         d_t = (-1.0/3.0) * field_grad * scale;
-    }
-
-    torch::autograd::variable_list grads(8);
-    grads[0] = dcoords;      // d/d coords
-    grads[1] = at::Tensor(); // d/d box
-    grads[2] = at::Tensor(); // d/d q
-    grads[3] = d_p;          // d/d p (Dipoles)
-    grads[4] = d_t;          // d/d t (Quadrupoles)
-    grads[5] = at::Tensor(); // d/d K_t
-    grads[6] = at::Tensor(); // d/d rank_t
-    grads[7] = at::Tensor(); // d/d alpha_t
+    at::Tensor ignore;
+    torch::autograd::variable_list grads(7);
+    grads[0] = coords_grad;                    // d/d coords
+    grads[1] = ignore;                        // d/d box
+    grads[2] = q_grad;                        // d/d q
+    grads[3] = (rank >= 1) ? p_grad : ignore; // d/d p (Dipoles)
+    grads[4] = (rank >= 2) ? t_grad : ignore; // d/d t (Quadrupoles)
+    grads[5] = ignore;                        // d/d k_max
+    grads[6] = ignore;                        // d/d alpha
     return grads;
-  }
+}
+
 };
 
+
+at::Tensor ewald_long_range_cuda(
+    at::Tensor& coords, 
+    at::Tensor& box, 
+    at::Tensor& q, 
+    c10::optional<at::Tensor> p, 
+    c10::optional<at::Tensor> t,
+    at::Scalar k_max,  
+    at::Scalar alpha
+) {
+    return EwaldEnergyFunctionCuda::apply(coords, box, q, p, t, k_max, alpha);
+}
+
+
+
+class EwaldAllFunctionCuda : public torch::autograd::Function<EwaldAllFunctionCuda> {
+
+public:
+
+static torch::autograd::variable_list forward(
+    torch::autograd::AutogradContext* ctx,
+    at::Tensor& coords, 
+    at::Tensor& box, 
+    at::Tensor& q, 
+    c10::optional<at::Tensor>& p, 
+    c10::optional<at::Tensor>& t,
+    at::Scalar k_max,  
+    at::Scalar alpha
+) {
+
+    at::cuda::CUDAGuard guard(coords.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto opts = coords.options();
+
+    const int64_t K = k_max.toLong();
+    const int64_t N = coords.size(0);
+
+    // Determine rank from optional tensors
+    int64_t rank = 0;
+    if (t.has_value()) {
+        rank = 2;
+    } else if (p.has_value()) {
+        rank = 1;
+    }
+    const double Vd = at::det(box).item<double>();
+
+    // Prepare output tensors
+    const int64_t M = K * ( K * (4*K+6) + 3 );
+    auto kvec = at::empty({4, M}, opts);
+    auto Sreal = at::zeros({M}, opts);
+    auto Simag = at::zeros({M}, opts);
+    auto pot = at::zeros({N}, opts);
+    auto field = at::zeros({N,3}, opts);
+    auto field_grad = at::zeros({N,3,3}, opts);
+    auto forces = at::zeros({N,3}, opts);
+    auto energy = at::zeros({}, opts);
+
+    ctx->saved_data["rank"] = rank;
+    ctx->saved_data["alpha"] = alpha;
+    ctx->saved_data["K"] = K;
+    ctx->saved_data["Vd"] = Vd;
+    ctx->saved_data["N"] = N;
+    ctx->saved_data["M"] = M;
+
+    // Reciprocal lattice vectors and box volume
+    at::Tensor recip = at::linalg_inv(box);
+
+    AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "ewald_forward", ([&] {
+        const scalar_t alpha_val = static_cast<scalar_t>(alpha.toDouble());
+        const scalar_t V = static_cast<scalar_t>(Vd);
+
+        // 1. Prepare k-vectors
+        constexpr int BLOCK_SIZE_KVECS = 256;
+        const int GRID_SIZE_KVECS = (M + BLOCK_SIZE_KVECS - 1) / BLOCK_SIZE_KVECS;
+        prepare_k_constants_kernel<scalar_t><<<GRID_SIZE_KVECS, BLOCK_SIZE_KVECS, 0, stream>>>(
+            K, alpha_val,
+            recip.data_ptr<scalar_t>(),
+            kvec.data_ptr<scalar_t>()
+        );
+
+        // 2. Forward 
+        const int GRID_SIZE_FWD = M;
+        const int GRID_SIZE_BWD = N;
+        constexpr int BLOCK_SIZE = 256;
+        if (rank == 0) {
+            compute_self_contribution_kernel_rank_0<scalar_t><<<GRID_SIZE_FWD, BLOCK_SIZE, 0, stream>>>(
+                q.data_ptr<scalar_t>(), N, alpha_val,
+                energy.data_ptr<scalar_t>(),
+                pot.data_ptr<scalar_t>()
+            );
+            ewald_forward_kernel<scalar_t, 0><<<GRID_SIZE_FWD, BLOCK_SIZE, 0, stream>>>(
+                kvec.data_ptr<scalar_t>(),
+                coords.data_ptr<scalar_t>(),
+                q.data_ptr<scalar_t>(),
+                nullptr,
+                nullptr,
+                M, N, V,
+                Sreal.data_ptr<scalar_t>(),
+                Simag.data_ptr<scalar_t>(),
+                energy.data_ptr<scalar_t>()
+            );
+            ewald_backward_kernel<scalar_t, 0, BLOCK_SIZE><<<GRID_SIZE_BWD, BLOCK_SIZE, 0, stream>>>(
+                kvec.data_ptr<scalar_t>(),
+                Sreal.data_ptr<scalar_t>(),
+                Simag.data_ptr<scalar_t>(),
+                coords.data_ptr<scalar_t>(),
+                q.data_ptr<scalar_t>(),
+                nullptr,
+                nullptr,
+                M, N, V, alpha_val,
+                pot.data_ptr<scalar_t>(),
+                field.data_ptr<scalar_t>(),
+                field_grad.data_ptr<scalar_t>(),
+                forces.data_ptr<scalar_t>()
+            );
+        } else if (rank == 1) {
+            compute_self_contribution_kernel_rank_1<scalar_t><<<GRID_SIZE_FWD, BLOCK_SIZE, 0, stream>>>(
+                q.data_ptr<scalar_t>(), p->data_ptr<scalar_t>(),
+                N, alpha_val,
+                energy.data_ptr<scalar_t>(),
+                pot.data_ptr<scalar_t>(),
+                field.data_ptr<scalar_t>()
+            );
+            ewald_forward_kernel<scalar_t, 1><<<GRID_SIZE_FWD, BLOCK_SIZE, 0, stream>>>(
+                kvec.data_ptr<scalar_t>(),
+                coords.data_ptr<scalar_t>(),
+                q.data_ptr<scalar_t>(),
+                p->data_ptr<scalar_t>(),
+                nullptr,
+                M, N, V,
+                Sreal.data_ptr<scalar_t>(),
+                Simag.data_ptr<scalar_t>(),
+                energy.data_ptr<scalar_t>()
+            );
+            ewald_backward_kernel<scalar_t, 1, BLOCK_SIZE><<<GRID_SIZE_BWD, BLOCK_SIZE, 0, stream>>>(
+                kvec.data_ptr<scalar_t>(),
+                Sreal.data_ptr<scalar_t>(),
+                Simag.data_ptr<scalar_t>(),
+                coords.data_ptr<scalar_t>(),
+                q.data_ptr<scalar_t>(),
+                p->data_ptr<scalar_t>(),
+                nullptr,
+                M, N, V, alpha_val,
+                pot.data_ptr<scalar_t>(),
+                field.data_ptr<scalar_t>(),
+                field_grad.data_ptr<scalar_t>(),
+                forces.data_ptr<scalar_t>()
+            );
+        } else {
+            compute_self_contribution_kernel_rank_2<scalar_t><<<GRID_SIZE_FWD, BLOCK_SIZE, 0, stream>>>(
+                q.data_ptr<scalar_t>(), p->data_ptr<scalar_t>(), t->data_ptr<scalar_t>(),
+                N, alpha_val,
+                energy.data_ptr<scalar_t>(),
+                pot.data_ptr<scalar_t>(),
+                field.data_ptr<scalar_t>(),
+                field_grad.data_ptr<scalar_t>()
+            );
+            ewald_forward_kernel<scalar_t, 2><<<GRID_SIZE_FWD, BLOCK_SIZE, 0, stream>>>(
+                kvec.data_ptr<scalar_t>(),
+                coords.data_ptr<scalar_t>(),
+                q.data_ptr<scalar_t>(),
+                p->data_ptr<scalar_t>(),
+                t->data_ptr<scalar_t>(),
+                M, N, V,
+                Sreal.data_ptr<scalar_t>(),
+                Simag.data_ptr<scalar_t>(),
+                energy.data_ptr<scalar_t>()
+            );
+            ewald_backward_kernel<scalar_t, 2, BLOCK_SIZE><<<GRID_SIZE_BWD, BLOCK_SIZE, 0, stream>>>(
+                kvec.data_ptr<scalar_t>(),
+                Sreal.data_ptr<scalar_t>(),
+                Simag.data_ptr<scalar_t>(),
+                coords.data_ptr<scalar_t>(),
+                q.data_ptr<scalar_t>(),
+                p->data_ptr<scalar_t>(),
+                t->data_ptr<scalar_t>(),
+                M, N, V, alpha_val,
+                pot.data_ptr<scalar_t>(),
+                field.data_ptr<scalar_t>(),
+                field_grad.data_ptr<scalar_t>(),
+                forces.data_ptr<scalar_t>()
+            );
+        }
+    }));
+        
+    // save for backward pass
+    at::Tensor p_saved = p.has_value() ? p.value() : at::Tensor();
+    at::Tensor t_saved = t.has_value() ? t.value() : at::Tensor();
+    ctx->save_for_backward({
+        coords, box, q, p_saved, t_saved, 
+        kvec, Sreal, Simag, forces, pot, field, field_grad});
+
+    // Prepare output list
+    torch::autograd::variable_list out(3);
+    out[0] = energy;
+    out[1] = pot;
+    out[2] = field;
+    return out;
+}
+
+static torch::autograd::variable_list backward(
+    torch::autograd::AutogradContext* ctx,
+    torch::autograd::variable_list grad_outputs
+) {
+    
+    int64_t rank = ctx->saved_data["rank"].toInt();
+    int64_t K = ctx->saved_data["K"].toInt();
+    int64_t N = ctx->saved_data["N"].toInt();
+    int64_t M = ctx->saved_data["M"].toInt();
+
+    // Retrieve saved tensors: {coords, box, q, p_saved, t_saved, kvec, Sreal, Simag, forces, pot, field, field_grad}
+    auto saved = ctx->get_saved_variables();
+    at::Tensor coords = saved[0];
+    at::Tensor box = saved[1];
+    at::Tensor q = saved[2];
+    at::Tensor p = saved[3];
+    at::Tensor t = saved[4];
+    at::Tensor kvec = saved[5];
+    at::Tensor Sreal = saved[6];
+    at::Tensor Simag = saved[7];
+    at::Tensor forces = saved[8];
+    at::Tensor pot = saved[9];
+    at::Tensor field = saved[10];
+    at::Tensor field_grad = saved[11];
+
+    at::cuda::CUDAGuard guard(coords.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto opts = coords.options();
+
+    // Get gradient w.r.t. energy (scalar)
+    at::Tensor grad_energy = grad_outputs[0];
+    at::Tensor grad_pot = grad_outputs[1];
+    at::Tensor grad_field = grad_outputs[2];
+
+    // Create zero tensors for grad_pot and grad_field if they're not defined
+    // This ensures we can safely call .data_ptr() on them in the kernel
+    if (!grad_pot.defined()) {
+        grad_pot = at::zeros({N}, opts);
+    }
+    if (!grad_field.defined()) {
+        grad_field = at::zeros({N, 3}, opts);
+    }   
+
+    // Compute gradients:
+    at::Tensor coords_grad = grad_energy.defined() ? -grad_energy * forces : at::zeros({N,3}, opts);    
+    at::Tensor q_grad = grad_energy.defined() ? grad_energy * pot : at::zeros({N}, opts);
+    at::Tensor p_grad, t_grad;
+    if (rank >= 1) {
+        p_grad = grad_energy.defined() ? -grad_energy * field : at::zeros({N, 3}, opts);
+    }
+    if (rank >= 2) {
+        t_grad = grad_energy.defined() ? -grad_energy * field_grad * (1.0/3.0) : at::zeros({N, 3, 3}, opts);
+    }
+
+    // Aux tensors for the Fourier gradient kernel
+    at::Tensor Fdr = at::zeros({M}, opts);
+    at::Tensor Fdi = at::zeros({M}, opts);
+    
+    AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "ewald_backward_2", ([&] {
+        scalar_t alpha = static_cast<scalar_t>(ctx->saved_data["alpha"].toDouble());
+        scalar_t V = static_cast<scalar_t>(ctx->saved_data["Vd"].toDouble());
+        constexpr int BLOCK_SIZE = 256;
+
+        if ( rank == 2 ) {
+            ewald_fourier_gradient_kernel<scalar_t, 2, BLOCK_SIZE><<<M, BLOCK_SIZE, 0, stream>>>(
+                kvec.data_ptr<scalar_t>(),
+                coords.data_ptr<scalar_t>(),
+                grad_pot.data_ptr<scalar_t>(),
+                grad_field.data_ptr<scalar_t>(),
+                M, N, V,
+                Fdr.data_ptr<scalar_t>(), Fdi.data_ptr<scalar_t>()
+            );
+            ewald_backward_with_fields_kernel<scalar_t, 2, BLOCK_SIZE><<<N, BLOCK_SIZE, 0, stream>>>(
+                kvec.data_ptr<scalar_t>(),
+                Fdr.data_ptr<scalar_t>(), Fdi.data_ptr<scalar_t>(),
+                coords.data_ptr<scalar_t>(),
+                q.data_ptr<scalar_t>(), p.data_ptr<scalar_t>(), t.data_ptr<scalar_t>(),
+                grad_pot.data_ptr<scalar_t>(),
+                grad_field.data_ptr<scalar_t>(),
+                Sreal.data_ptr<scalar_t>(), Simag.data_ptr<scalar_t>(),
+                M, alpha, V,
+                coords_grad.data_ptr<scalar_t>(),
+                q_grad.data_ptr<scalar_t>(), p_grad.data_ptr<scalar_t>(), t_grad.data_ptr<scalar_t>()
+            );
+        }
+        else if ( rank == 1 ) {
+            q_grad = grad_energy.defined() ? grad_energy * pot : at::zeros({N}, opts);
+            p_grad = grad_energy.defined() ? -grad_energy * field : at::zeros({N, 3}, opts);
+            ewald_fourier_gradient_kernel<scalar_t, 1, BLOCK_SIZE><<<M, BLOCK_SIZE, 0, stream>>>(
+                kvec.data_ptr<scalar_t>(),
+                coords.data_ptr<scalar_t>(),
+                grad_pot.data_ptr<scalar_t>(),
+                grad_field.data_ptr<scalar_t>(),
+                M, N, V,
+                Fdr.data_ptr<scalar_t>(), Fdi.data_ptr<scalar_t>()
+            );
+            ewald_backward_with_fields_kernel<scalar_t, 1, BLOCK_SIZE><<<N, BLOCK_SIZE, 0, stream>>>(
+                kvec.data_ptr<scalar_t>(),
+                Fdr.data_ptr<scalar_t>(),
+                Fdi.data_ptr<scalar_t>(),
+                coords.data_ptr<scalar_t>(),
+                q.data_ptr<scalar_t>(), p.data_ptr<scalar_t>(), nullptr,
+                grad_pot.data_ptr<scalar_t>(),
+                grad_field.data_ptr<scalar_t>(),
+                Sreal.data_ptr<scalar_t>(),
+                Simag.data_ptr<scalar_t>(),
+                M, alpha, V,
+                coords_grad.data_ptr<scalar_t>(),
+                q_grad.data_ptr<scalar_t>(), p_grad.data_ptr<scalar_t>(), nullptr
+            );
+        }
+        else {
+            ewald_fourier_gradient_kernel<scalar_t, 0, BLOCK_SIZE><<<M, BLOCK_SIZE, 0, stream>>>(
+                kvec.data_ptr<scalar_t>(),
+                coords.data_ptr<scalar_t>(),
+                grad_pot.data_ptr<scalar_t>(),
+                grad_field.data_ptr<scalar_t>(),
+                M, N, V,
+                Fdr.data_ptr<scalar_t>(), Fdi.data_ptr<scalar_t>()
+            );
+            ewald_backward_with_fields_kernel<scalar_t, 0, BLOCK_SIZE><<<N, BLOCK_SIZE, 0, stream>>>(
+                kvec.data_ptr<scalar_t>(),
+                Fdr.data_ptr<scalar_t>(), Fdi.data_ptr<scalar_t>(),
+                coords.data_ptr<scalar_t>(),
+                q.data_ptr<scalar_t>(), nullptr, nullptr,
+                grad_pot.data_ptr<scalar_t>(),
+                grad_field.data_ptr<scalar_t>(),
+                Sreal.data_ptr<scalar_t>(),
+                Simag.data_ptr<scalar_t>(),
+                M, alpha, V,
+                coords_grad.data_ptr<scalar_t>(),
+                q_grad.data_ptr<scalar_t>(), nullptr, nullptr
+            );
+        }
+    }));
+
+    at::Tensor ignore;
+    torch::autograd::variable_list grads(7);
+    grads[0] = coords_grad;                   // d/d coords
+    grads[1] = ignore;                        // d/d box
+    grads[2] = q_grad;                        // d/d q
+    grads[3] = p_grad;                        // d/d p (Dipoles)
+    grads[4] = t_grad;                        // d/d t (Quadrupoles)
+    grads[5] = ignore;                        // d/d k_max
+    grads[6] = ignore;                        // d/d alpha
+    return grads;
+}
+
+};
+
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> ewald_long_range_all_cuda(
+    at::Tensor& coords, 
+    at::Tensor& box, 
+    at::Tensor& q, 
+    c10::optional<at::Tensor> p, 
+    c10::optional<at::Tensor> t,
+    at::Scalar k_max,  
+    at::Scalar alpha
+) {
+    auto outs = EwaldAllFunctionCuda::apply(coords, box, q, p, t, k_max, alpha);
+    return {outs[0], outs[1], outs[2]};
+}
+
+
 TORCH_LIBRARY_IMPL(torchff, AutogradCUDA, m) {
-  m.impl("ewald_long_range",
-         [](const at::Tensor& coords, const at::Tensor& box,
-            const at::Tensor& q, const at::Tensor& p, const at::Tensor& t,
-            int64_t K, int64_t rank, double alpha) {
-
-           auto K_t     = at::scalar_tensor(K,     at::TensorOptions().dtype(at::kLong));
-           auto rank_t  = at::scalar_tensor(rank,  at::TensorOptions().dtype(at::kLong));
-           auto alpha_t = at::scalar_tensor(alpha, at::TensorOptions().dtype(at::kDouble));
-
-           auto outs = EwaldLongRangeAllFunctionCuda::apply(
-               coords, box, q, p, t, K_t, rank_t, alpha_t);
-
-           return std::make_tuple(outs[0], outs[1], outs[2], outs[3], outs[4]);
-         });
+    m.impl("ewald_long_range", ewald_long_range_cuda);
+    m.impl("ewald_long_range_all", ewald_long_range_all_cuda);
 }

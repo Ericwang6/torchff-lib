@@ -329,8 +329,8 @@ __global__ void find_interacting_blocks(
     else {
         int32_t start_cidx_i = sorted_cell_indices[i * 32];
         int32_t start_cidx_j = sorted_cell_indices[j * 32];
-        int32_t end_cidx_i = (i == num_blocks - 1) ? sorted_cell_indices[i * 32 + 31]: ncx * ncy * ncz - 1;
-        int32_t end_cidx_j = (j == num_blocks - 1) ? sorted_cell_indices[j * 32 + 31]: ncx * ncy * ncz - 1;
+        int32_t end_cidx_i = (i == num_blocks - 1) ? ncx * ncy * ncz - 1: sorted_cell_indices[i * 32 + 31];
+        int32_t end_cidx_j = (j == num_blocks - 1) ? ncx * ncy * ncz - 1: sorted_cell_indices[j * 32 + 31];
         if ( is_interact(start_cidx_i, end_cidx_i, start_cidx_j, end_cidx_j, ncx, ncy, ncz, ncr) ) {
             n = atomicAdd(num_interacting_blocks, 1);
             interacting_blocks[n * 2] = i;
@@ -546,6 +546,11 @@ std::tuple<at::Tensor, at::Tensor> build_neighbor_list_cell_list_shared_cuda(
     // Step 4: Process interacting blocks to build neighbor list
     block_dim = 32;
     grid_dim = num_interacting_blocks.to(at::kCPU).item().toInt();
+    // std::cout << "Num interacting blocks: " << grid_dim << std::endl;
+
+    // std::chrono::duration<double> diff;
+    // auto start_time_build = std::chrono::steady_clock::now();
+
     AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "build_neighbor_list", ([&] {
         scalar_t cutoff2 = static_cast<scalar_t>(cutoff.toDouble() * cutoff.toDouble());
         build_neighbor_list_cell_list_shared_kernel<scalar_t><<<grid_dim, block_dim, 0, stream>>>(
@@ -560,6 +565,11 @@ std::tuple<at::Tensor, at::Tensor> build_neighbor_list_cell_list_shared_cuda(
             npairs.data_ptr<int32_t>()
         );
     }));
+
+    // cudaDeviceSynchronize();
+    // auto end_time_build = std::chrono::steady_clock::now();
+    // diff = end_time_build - start_time_build;
+    // std::cout << "Build time: " << diff.count() * 1000 << " ms" << std::endl;
     
     if ( !padding ) {
         cudaError_t err = cudaGetLastError();

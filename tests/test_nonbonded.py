@@ -102,121 +102,117 @@ def test_nonbonded_atom_pairs(device, dtype, requires_grad):
 
 
 
-# def test_nonbonded():
-#     dirname = os.path.dirname(__file__)
-#     pdb = app.PDBFile(os.path.join(dirname, 'water/water_10000.pdb'))
-#     top = pdb.getTopology()
-#     pos = pdb.getPositions()
+def test_nonbonded_cluster_pairs():
+    dirname = os.path.dirname(__file__)
+    pdb = app.PDBFile(os.path.join(dirname, 'water/water_10000.pdb'))
+    top = pdb.getTopology()
+    pos = pdb.getPositions()
 
-#     cutoff = 1.2
+    cutoff = 1.2
 
-#     ff = app.ForceField('tip3p.xml')
-#     system: mm.System = ff.createSystem(
-#         top,
-#         nonbondedMethod=app.PME,
-#         nonbondedCutoff=cutoff*unit.nanometer,
-#         constraints=None,
-#         rigidWater=False
-#     )
-#     coords = torch.tensor([[v.x, v.y, v.z] for v in pos], dtype=torch.float32, device='cuda', requires_grad=True)
-#     box = torch.tensor([[v.x, v.y, v.z] for v in top.getPeriodicBoxVectors()], dtype=torch.float32, device='cuda', requires_grad=True)
-#     print(box)
-#     # water excls
-#     exclusions = []
-#     for i in range(system.getNumParticles() // 3):
-#         exclusions.append([i*3+1, i*3+2])
-#         exclusions.append([i*3, i*3+2])
-#         exclusions.append([i*3, i*3+1])
-#     exclusions = torch.tensor(exclusions, dtype=torch.int32, requires_grad=False, device='cuda')
+    ff = app.ForceField('tip3p.xml')
+    system: mm.System = ff.createSystem(
+        top,
+        nonbondedMethod=app.PME,
+        nonbondedCutoff=cutoff*unit.nanometer,
+        constraints=None,
+        rigidWater=False
+    )
+    coords = torch.tensor([[v.x, v.y, v.z] for v in pos], dtype=torch.float32, device='cuda', requires_grad=True)
+    box = torch.tensor([[v.x, v.y, v.z] for v in top.getPeriodicBoxVectors()], dtype=torch.float32, device='cuda', requires_grad=False)
 
-#     omm_force = [f for f in system.getForces() if isinstance(f, mm.NonbondedForce)][0]
-#     charges, sigma, epsilon = [], [], []
-#     for i in range(omm_force.getNumParticles()):
-#         param = omm_force.getParticleParameters(i)
-#         charges.append(param[0].value_in_unit(unit.elementary_charge))
-#         # charges.append(0.0)
-#         sigma.append(param[1].value_in_unit(unit.nanometer))
-#         # epsilon.append(param[2].value_in_unit(unit.kilojoules_per_mole))
-#         epsilon.append(0.0)
+    # water excls
+    excl_i, excl_j = [], []
+    for n in range(system.getNumParticles()//3):
+        for i in range(3):
+            for j in range(3):
+                excl_i.append(n*3+i)
+                excl_j.append(n*3+j)
+    exclusions = torch.tensor([excl_i, excl_j], dtype=torch.int64, device='cuda')
 
+    omm_force = [f for f in system.getForces() if isinstance(f, mm.NonbondedForce)][0]
+    charges, sigma, epsilon = [], [], []
+    for i in range(omm_force.getNumParticles()):
+        param = omm_force.getParticleParameters(i)
+        # charges.append(param[0].value_in_unit(unit.elementary_charge))
+        charges.append(0.0)
+        sigma.append(param[1].value_in_unit(unit.nanometer))
+        epsilon.append(param[2].value_in_unit(unit.kilojoules_per_mole))
+        # epsilon.append(0.0)
 
-#     charges = torch.tensor(charges, dtype=torch.float32, device='cuda')
-#     sigma = torch.tensor(sigma, dtype=torch.float32, device='cuda')
-#     epsilon = torch.tensor(epsilon, dtype=torch.float32, device='cuda')
-#     cutoff = omm_force.getCutoffDistance().value_in_unit(unit.nanometer)
-#     prefac = torch.tensor(138.93544539709033, dtype=torch.float32, device='cuda')
+    charges = torch.tensor(charges, dtype=torch.float32, device='cuda', requires_grad=False)
+    sigma = torch.tensor(sigma, dtype=torch.float32, device='cuda', requires_grad=False)
+    epsilon = torch.tensor(epsilon, dtype=torch.float32, device='cuda', requires_grad=False)
+    cutoff = omm_force.getCutoffDistance().value_in_unit(unit.nanometer)
+    prefac = torch.tensor(138.93544539709033, dtype=torch.float32, device='cuda')
 
-#     # print(sigma, epsilon, charges)
-#     sorted_atom_indices, interacting_clusters, bitmask_exclusions, num_interacting_clusters = torchff.build_cluster_pairs(
-#         coords, box,
-#         cutoff, exclusions,
-#         0.5, 150000
-#     )
-#     print(torch.sum(interacting_clusters >= 0)/2)
-#     print(num_interacting_clusters)
+    sorted_atom_indices, cluster_exclusions, bitmask_exclusions, interacting_clusters, interacting_atoms = torchff.build_cluster_pairs(
+        coords, box, cutoff, exclusions, 0.7, -1
+    )
 
-#     # prune interacting clusters
-#     # boxInv = torch.linalg.inv(box)
-#     # indices = []
-#     # for i in tqdm(range(num_interacting_clusters.item())):
-#     #     if interacting_clusters[i, 0] == interacting_clusters[i, 1]:
-#     #         indices.append(i)
-#     #         continue
-#     #     x, y = interacting_clusters[i, 0], interacting_clusters[i, 1]
-#     #     atomsx = sorted_atom_indices[x*32:(x+1)*32]
-#     #     atomsy = sorted_atom_indices[y*32:(y+1)*32]
-#     #     pairs = torch.cartesian_prod(atomsx, atomsy)
-#     #     drVecs = coords[pairs[:, 0]] - coords[pairs[:, 1]]
-#     #     dsVecs = torch.matmul(drVecs, boxInv)
-#     #     dsVecsPBC = dsVecs - torch.floor(dsVecs + 0.5)
-#     #     drVecsPBC = torch.matmul(dsVecsPBC, box)
-#     #     dr = torch.norm(drVecsPBC, dim=1)
-#     #     mask = dr <= cutoff
-#     #     if torch.sum(mask) > 0:
-#     #         indices.append(i)
-
-#     # print(interacting_clusters.shape, num_interacting_clusters, len(indices))
+    print("Num cluster pairs w/  exclusions:", cluster_exclusions.shape[1])
+    print("Num cluster pairs w/o exclusions:", torch.sum(interacting_clusters != -1))
 
 
-#     static_sorted_atom_indices = torch.zeros_like(sorted_atom_indices, requires_grad=False)
-#     # static_interacting_clusters = interacting_clusters[torch.tensor(indices)]
-#     static_interacting_clusters = torch.zeros_like(interacting_clusters, requires_grad=False)
-#     static_interacting_clusters.copy_(interacting_clusters)
-#     # static_interacting_clusters = torch.full_like(interacting_clusters, -1, requires_grad=False)
-#     static_bitmask_exclusions = torch.zeros_like(bitmask_exclusions, requires_grad=False)
-    
-#     static_sorted_atom_indices.copy_(sorted_atom_indices)
-#     # static_interacting_clusters.copy_(interacting_clusters)
-#     static_bitmask_exclusions.copy_(bitmask_exclusions)
-
-#     ene = torchff.compute_nonbonded_energy_from_cluster_pairs(
-#         coords, box, sigma, epsilon, charges, prefac, cutoff, 
-#         static_sorted_atom_indices,
-#         static_interacting_clusters, 
-#         static_bitmask_exclusions, 
-#         True
-#     )
-#     print(ene)
-
-#     # g = torch.cuda.CUDAGraph()
-#     # with torch.cuda.graph(g):
-#     #     ene = torchff.compute_nonbonded_energy_from_cluster_pairs(
-#     #         coords, box, sigma, epsilon, charges, prefac, cutoff, 
-#     #         static_sorted_atom_indices,
-#     #         static_interacting_clusters, 
-#     #         static_bitmask_exclusions, 
-#     #         True
-#     #     )
-#     # g.replay()
+    # ene = torchff.compute_nonbonded_energy_from_cluster_pairs(
+    #     coords, box, sigma, epsilon, charges, prefac, cutoff, 
+    #     sorted_atom_indices, cluster_exclusions, bitmask_exclusions, interacting_clusters, interacting_atoms,
+    #     True
+    # )
+    # print(ene)
 
 
-#     forces = torch.zeros_like(coords, requires_grad=False)
-#     print(forces.dtype)
-#     perf_op(
-#         torchff.compute_nonbonded_forces_from_cluster_pairs,
-#         coords, box, sigma, epsilon, charges, prefac, cutoff, 
-#         static_sorted_atom_indices, static_interacting_clusters, static_bitmask_exclusions, forces,
-#         desc='nonbonded',
-#         run_backward=False,
-#         use_cuda_graph=True
-#     )
+    forces = torch.zeros_like(coords, requires_grad=False)
+    # perf_op(
+    #     torchff.compute_nonbonded_forces_from_cluster_pairs,
+    #     coords, box, sigma, epsilon, charges, prefac, cutoff, 
+    #     sorted_atom_indices, cluster_exclusions, bitmask_exclusions, interacting_clusters, interacting_atoms,
+    #     forces,
+    #     desc='nonbonded-forces-cluster-pairs',
+    #     run_backward=False,
+    #     use_cuda_graph=True
+    # )
+
+    perf_op(
+        torchff.compute_nonbonded_energy_from_cluster_pairs,
+        coords, box, sigma, epsilon, charges, prefac, cutoff, 
+        sorted_atom_indices, cluster_exclusions, bitmask_exclusions, interacting_clusters, interacting_atoms,
+        True,
+        desc='nonbonded-forces(backward)-cluster-pairs',
+        run_backward=True,
+        use_cuda_graph=True
+    )
+
+    pairs, _ = torchff.build_neighbor_list_nsquared(coords, box, cutoff, -1, False)
+    mask = torch.floor_divide(pairs[:, 0], 3) != torch.floor_divide(pairs[:, 1], 3)
+    pairs = pairs[mask, :].clone()
+    print(f"Num pairs: {pairs.shape[0]}")
+
+    # perf_op(
+    #     torchff.compute_nonbonded_forces_from_atom_pairs,
+    #     coords, pairs, box, sigma, epsilon, charges, prefac, cutoff-0.1, 
+    #     forces,
+    #     desc='nonbonded-forces-atom-pairs',
+    #     run_backward=False,
+    #     use_cuda_graph=True
+    # )
+
+
+    # perf_op(
+    #     torchff.compute_nonbonded_energy_from_atom_pairs,
+    #     coords, pairs, box, sigma, epsilon, charges, prefac, cutoff, 
+    #     True,
+    #     desc='nonbonded-forces(backward)-atom-pairs',
+    #     run_backward=True,
+    #     use_cuda_graph=True
+    # )
+
+    # nb = Nonbonded()
+    # perf_op(
+    #     nb,
+    #     coords, pairs, box, sigma, epsilon, charges, prefac, cutoff, 
+    #     True,
+    #     desc='nonbonded-forces-atom-pairs',
+    #     run_backward=True,
+    #     use_cuda_graph=True
+    # )

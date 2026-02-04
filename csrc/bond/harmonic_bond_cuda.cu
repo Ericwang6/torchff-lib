@@ -10,38 +10,40 @@
 #include <chrono>
 
 #include "common/vec3.cuh"
+#include "common/reduce.cuh"
 
 
-template <typename scalar_t>
+template <typename scalar_t, int BLOCK_SIZE>
 __global__ void harmonic_bond_cuda_kernel(
     scalar_t* coords, 
-    int32_t* bonds, 
+    int64_t* bonds, 
     scalar_t* b0, 
     scalar_t* k, 
-    int32_t nbonds,
-    scalar_t* ene,
+    int64_t nbonds,
+    scalar_t* ene_out,
     scalar_t* coord_grad, 
     scalar_t* b0_grad, 
     scalar_t* k_grad,
     scalar_t sign
 ) {
     
-    for (int index = threadIdx.x+blockIdx.x*blockDim.x; index < nbonds; index += blockDim.x*gridDim.x) {
+    scalar_t ene = scalar_t(0.0);
+    for (int index = threadIdx.x+blockIdx.x*BLOCK_SIZE; index < nbonds; index += BLOCK_SIZE*gridDim.x) {
         int offset = index * 2;
-        int32_t offset_0 = bonds[offset] * 3;
-        int32_t offset_1 = bonds[offset + 1] * 3;
+        int64_t offset_0 = bonds[offset] * 3;
+        int64_t offset_1 = bonds[offset + 1] * 3;
         scalar_t* coords_0 = coords + offset_0;
         scalar_t* coords_1 = coords + offset_1;
         scalar_t dx = coords_1[0] - coords_0[0];
         scalar_t dy = coords_1[1] - coords_0[1];
         scalar_t dz = coords_1[2] - coords_0[2];
-        scalar_t b = sqrt_(dx * dx + dy * dy + dz * dz);
+        scalar_t b = norm3d_(dx, dy, dz);
         
         scalar_t k_ = k[index];
         scalar_t db = (b - b0[index]);
     
-        if ( ene ) {
-            ene[index] = k_ * db * db / 2;
+        if ( ene_out ) {
+            ene += k_ * db * db / 2;
         }
 
         if ( coord_grad ) {
@@ -64,6 +66,9 @@ __global__ void harmonic_bond_cuda_kernel(
             b0_grad[index] = -k_ * db;
         }
     }
+    if ( ene_out ) {
+        block_reduce_sum<scalar_t, BLOCK_SIZE>(ene, ene_out);
+    }
 }
 
 
@@ -78,31 +83,30 @@ public:
         at::Tensor& k
     )
     {
-        int32_t nbonds = bonds.size(0);
+        int nbonds = bonds.size(0);
         
         auto props = at::cuda::getCurrentDeviceProperties();
         auto stream = at::cuda::getCurrentCUDAStream();
-        int32_t block_dim = 256;
-        int32_t grid_dim = std::min(
-            (nbonds + block_dim - 1) / block_dim,
+        constexpr int BLOCK_SIZE = 256;
+        int GRID_SIZE = std::min(
+            (nbonds + BLOCK_SIZE - 1) / BLOCK_SIZE,
             props->multiProcessorCount*props->maxBlocksPerMultiProcessor
         );
 
-        at::Tensor e = at::zeros({nbonds}, coords.options());
+        at::Tensor ene_out = at::zeros({1}, coords.options());
         at::Tensor coord_grad = at::zeros_like(coords, coords.options());
         at::Tensor b0_grad = at::zeros_like(b0, b0.options());
         at::Tensor k_grad = at::zeros_like(k, k.options());
         ctx->save_for_backward({coord_grad, b0_grad, k_grad});
 
         AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "compute_harmonic_bond_cuda", ([&] {
-            harmonic_bond_cuda_kernel<scalar_t><<<grid_dim, block_dim, 0, stream>>>(
+            harmonic_bond_cuda_kernel<scalar_t, BLOCK_SIZE><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(
                 coords.data_ptr<scalar_t>(),
-                bonds.data_ptr<int32_t>(),
+                bonds.data_ptr<int64_t>(),
                 b0.data_ptr<scalar_t>(),
                 k.data_ptr<scalar_t>(),
                 nbonds,
-                // ene.data_ptr<scalar_t>(),
-                e.data_ptr<scalar_t>(),
+                ene_out.data_ptr<scalar_t>(),
                 (coords.requires_grad()) ? coord_grad.data_ptr<scalar_t>() : nullptr,
                 (b0.requires_grad()) ? b0_grad.data_ptr<scalar_t>() : nullptr,
                 (k.requires_grad()) ? k_grad.data_ptr<scalar_t>() : nullptr,
@@ -110,7 +114,7 @@ public:
             );
         }));
         
-        return at::sum(e);
+        return ene_out;
     }
 
     static std::vector<at::Tensor> backward(
@@ -143,18 +147,18 @@ void compute_harmonic_bond_forces_cuda(
     at::Tensor& forces
 ) {
 
-    int32_t nbonds = bonds.size(0);
+    int nbonds = bonds.size(0);
     auto props = at::cuda::getCurrentDeviceProperties();
-    int32_t block_dim = 256;
-    int32_t grid_dim = std::min(
-        (nbonds + block_dim - 1) / block_dim,
+    constexpr int BLOCK_SIZE = 256;
+    int GRID_SIZE = std::min(
+        (nbonds + BLOCK_SIZE - 1) / BLOCK_SIZE,
         props->multiProcessorCount*props->maxBlocksPerMultiProcessor
     );
     auto stream = at::cuda::getCurrentCUDAStream();
     AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "compute_harmonic_bond_forces_cuda", ([&] {
-        harmonic_bond_cuda_kernel<scalar_t><<<grid_dim, block_dim, 0, stream>>>(
+        harmonic_bond_cuda_kernel<scalar_t, BLOCK_SIZE><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(
             coords.data_ptr<scalar_t>(),
-            bonds.data_ptr<int32_t>(),
+            bonds.data_ptr<int64_t>(),
             b0.data_ptr<scalar_t>(),
             k.data_ptr<scalar_t>(),
             nbonds,

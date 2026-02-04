@@ -1,4 +1,4 @@
-import os
+import os, time
 import sys
 import torch
 import torch.nn as nn
@@ -84,21 +84,21 @@ class NonbondedTorchForce(nn.Module):
         self.prefac = torch.tensor(138.93544539709033, dtype=torch.float32, device='cuda')
 
         self.counter = 0
-        self.nsteps_rebuild = 10
+        self.nsteps_rebuild = 1
         self.pairs = torch.tensor([[0, 1]], dtype=torch.int32, device='cuda')
 
         self.max_npairs = omm_force.getNumParticles() * 500
         self.prev_coords = torch.zeros((omm_force.getNumParticles(), 3), dtype=torch.float32, device='cuda')
     
     def forward(self, coords: torch.Tensor, box: torch.Tensor):
-        if self.counter % self.nsteps_rebuild == 0:
-            # pairs = torchff.build_neighbor_list_nsquared(coords, box, self.cutoff, self.max_npairs)
+        # if self.counter % self.nsteps_rebuild == 0:
+            # pairs = torchffs.build_neighbor_list_nsquared(coords, box, self.cutoff, self.max_npairs)
         
         # if self.counter == 0 or torch.norm(coords - self.prev_coords, dim=1) > 0.2:
-            pairs = torchff.build_neighbor_list_cell_list(coords, box, self.cutoff+0.4, self.max_npairs, self.cutoff+0.4, False)
-            mask = torch.floor_divide(pairs[:, 0], 3) != torch.floor_divide(pairs[:, 1], 3)
-            self.pairs = pairs[mask, :]
-            self.counter += 1
+        pairs = torchff.build_neighbor_list_cell_list(coords, box, self.cutoff, self.max_npairs, self.cutoff, False)
+        mask = torch.floor_divide(pairs[:, 0], 3) != torch.floor_divide(pairs[:, 1], 3)
+        self.pairs = pairs[mask, :]
+            # self.counter += 1
 
         coul = torchff.compute_coulomb_energy(coords, self.pairs, box, self.charges, self.prefac, self.cutoff)
         lj = torchff.compute_lennard_jones_energy(coords, self.pairs, box, self.sigma, self.epsilon, self.cutoff)
@@ -133,29 +133,46 @@ class TorchSystem(nn.Module):
                 self.forces.append(HarmonicBondTorchForce(force))
             if isinstance(force, mm.HarmonicAngleForce):
                 self.forces.append(HarmonicAngleTorchForce(force))
-            if isinstance(force, mm.NonbondedForce):
-                self.forces.append(NonbondedTorchForce(force))
+            # if isinstance(force, mm.NonbondedForce):
+            #     self.forces.append(NonbondedTorchForce(force))
+
+        self.ene = torch.tensor(0.0, dtype=torch.float32, device='cuda')
+        self.forces_tensor = torch.zeros((omm_system.getNumParticles(), 3), dtype=torch.float32, device='cuda')
     
     def forward(self, coords: torch.Tensor, box: torch.Tensor):
-        ene = torch.tensor(0.0, dtype=coords.dtype, device=coords.device)
-        for force in self.forces:
-            ene += force(coords, box)
-        return ene
+        return self.forces[0](coords, box) + self.forces[1](coords, box)
+        # ene = torch.tensor(0.0, dtype=coords.dtype, device=coords.device)
+        # for force in self.forces:
+        #     ene += force(coords, box)
+        # return ene
+        # return self.fake_zero, self.fake_zeros
+        # self.ene.zero_()
+        # self.forces_tensor.zero_()
+        # torchff.compute_harmonic_bond_energy_and_forces(
+        #     coords, 
+        #     self.forces[0].bonds,
+        #     self.forces[0].b0,
+        #     self.forces[0].k,
+        #     self.ene,
+        #     self.forces_tensor
+        # )
+        # return self.ene, self.forces_tensor
 
 
 dirname = os.path.dirname(__file__)
-pdb = app.PDBFile(os.path.join(dirname, 'water/water_3000.pdb'))
+pdb = app.PDBFile(os.path.join(dirname, 'water/water_10000.pdb'))
 top = pdb.getTopology()
 pos = pdb.getPositions()
 
 ff = app.ForceField('tip3p.xml')
-system = ff.createSystem(
+system: mm.System = ff.createSystem(
     top,
     nonbondedMethod=app.CutoffPeriodic,
     nonbondedCutoff=0.4*unit.nanometer,
     constraints=None,
     rigidWater=False
 )
+# system.removeForce([i for i in range(system.getNumForces()) if isinstance(system.getForce(i), mm.NonbondedForce)][0])
 
 for idx in range(system.getNumForces()):
     f = system.getForce(idx)
@@ -168,9 +185,33 @@ t_system = mm.System()
 for i in range(system.getNumParticles()):
     t_system.addParticle(system.getParticleMass(i))
 
-model = TorchSystem(system)
-tforce = TorchForce(torch.jit.script(model))
+model = torch.jit.script(TorchSystem(system))
+# model = TorchSystem(system)
+
+# # benchmark pure inference
+# pos_tensor = torch.tensor([[v.x, v.y, v.z] for v in pos], dtype=torch.float32, device='cuda', requires_grad=True)
+# box_tensor = torch.tensor([[v.x, v.y, v.z] for v in top.getPeriodicBoxVectors()], dtype=torch.float32, device='cuda', requires_grad=True)
+# for _ in range(10):
+#     ene = model(pos_tensor, box_tensor)
+#     ene.backward()
+#     # pos_tensor = pos_tensor + 1.0
+#     # pos_tensor.grad.zero_()
+
+# start = time.perf_counter()
+
+# for i in range(1000):
+#     ene = model(pos_tensor, box_tensor)
+#     ene.backward()
+#         # pos_tensor = pos_tensor + 1.0
+#         # pos_tensor.grad.zero_()
+# end = time.perf_counter()
+# print(f"Pure inference time: {(end-start):.4f} ms")
+
+# exit(0)
+
+tforce = TorchForce(model)
 tforce.setOutputsForces(False)
+tforce.setProperty("useCUDAGraphs", "true")
 tforce.setUsesPeriodicBoundaryConditions(True)
 
 t_system.addForce(tforce)
@@ -184,21 +225,22 @@ forces_ref = state.getForces(asNumpy=True).value_in_unit(unit.kilojoule_per_mole
 print(f'OpenMM Energy: {ene_ref} kJ/mol')
 
 
-context = mm.Context(t_system, mm.VerletIntegrator(1.0), mm.Platform.getPlatformByName('CUDA'))
-context.setPeriodicBoxVectors(*top.getPeriodicBoxVectors())
-context.setPositions(pos)
-state = context.getState(getEnergy=True, getForces=True)
-ene = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-forces = state.getForces(asNumpy=True).value_in_unit(unit.kilojoule_per_mole/unit.nanometer)
-print(f'TorchFF Energy: {ene} kJ/mol')
+# context = mm.Context(t_system, mm.VerletIntegrator(1.0), mm.Platform.getPlatformByName('CUDA'))
+# context.setPeriodicBoxVectors(*top.getPeriodicBoxVectors())
+# context.setPositions(pos)
+# state = context.getState(getEnergy=True, getForces=True)
+# ene = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+# forces = state.getForces(asNumpy=True).value_in_unit(unit.kilojoule_per_mole/unit.nanometer)
+# print(f'TorchFF Energy: {ene} kJ/mol')
 
 
 integrator = mm.VerletIntegrator(0.001)
 simulation = app.Simulation(
     top, 
-    t_system, 
-    # system,
-    integrator
+    # t_system, 
+    system,
+    integrator,
+    mm.Platform.getPlatformByName('CUDA')
 )
 simulation.context.setPeriodicBoxVectors(*top.getPeriodicBoxVectors())
 simulation.context.setPositions(pos)
@@ -206,8 +248,9 @@ simulation.context.setVelocities(np.zeros((top.getNumAtoms(), 3)))
 # print(simulation.context.getState(getEnergy=True).getPotentialEnergy())
 # simulation.minimizeEnergy()
 
+
 # Configure a reporter to print to the console every 0.1 ps (100 steps)
-reporter = app.StateDataReporter(file=sys.stdout, reportInterval=100, step=True, time=True, potentialEnergy=True, kineticEnergy=True, totalEnergy=True, temperature=True, speed=True)
+reporter = app.StateDataReporter(file=sys.stdout, reportInterval=5000, step=True, time=True, potentialEnergy=True, kineticEnergy=True, totalEnergy=True, temperature=True, speed=True)
 simulation.reporters.append(reporter)
 
 simulation.step(10000)
