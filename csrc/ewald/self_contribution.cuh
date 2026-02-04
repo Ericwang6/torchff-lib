@@ -74,7 +74,7 @@ __global__ void compute_self_contribution_kernel_rank_2(
     const T pref_fg = a_over_rpi * (16.0 * alpha2 * alpha2 / 15.0);
     
     T e = 0;
-    for (int index = threadIdx.x+blockIdx.x*blockDim.x; index < N; index += blockDim.x*gridDim.x) {
+    for (int index = threadIdx.x+blockIdx.x*BLOCK_SIZE; index < N; index += BLOCK_SIZE*gridDim.x) {
         const T qi = q[index];
         const T px = p[3*index + 0];
         const T py = p[3*index + 1];

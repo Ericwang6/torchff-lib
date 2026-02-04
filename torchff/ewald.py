@@ -1,5 +1,3 @@
-from typing import Optional
-
 import torch 
 import torch.nn as nn
 
@@ -39,19 +37,9 @@ class Ewald(nn.Module):
             else:
                 return torch.ops.torchff.ewald_long_range_all(coords, box, q, p, t, self.kmax, self.alpha)
         else:
-            fields = self._compute_fields_python(coords, box, q, p, t)
-            if self.rank == 0:
-                energy = 0.5 * torch.sum(q * fields[0])
-            elif self.rank == 1:
-                energy = 0.5 * (torch.sum(q * fields[0]) - torch.sum(p * fields[1]))
-            else:
-                energy = 0.5 * (torch.sum(q * fields[0]) - torch.sum(p * fields[1]) - torch.sum(t * fields[2]) / 3)
-            if not self.return_fields:
-                return energy
-            else:
-                return energy, *fields
+            return self._forward_python(coords, box, q, p, t)
 
-    def _compute_fields_python(self, coords, box, q, p=None, t=None):
+    def _forward_python(self, coords, box, q, p=None, t=None):
         box_inv = torch.inverse(box)
         V = torch.det(box)
 
@@ -82,7 +70,14 @@ class Ewald(nn.Module):
         S_real = torch.sum(cos_k_dot_r * L_real - sin_k_dot_r * L_imag, dim=1) # (M,)
         S_imag = torch.sum(cos_k_dot_r * L_imag + sin_k_dot_r * L_real, dim=1) # (M,)
         
-        # return torch.sum(gaussian_factors * (S_real ** 2 + S_imag ** 2)) / torch.pi / V
+        energy = torch.sum(gaussian_factors * (S_real ** 2 + S_imag ** 2)) / torch.pi / V
+        energy -= self.alpha_over_root_pi * torch.sum(q*q)
+        if self.rank >= 1:
+            energy -= self.alpha_over_root_pi * (2*self.alpha2/3) * torch.sum(p*p)
+        if self.rank == 2:
+            energy -= self.alpha_over_root_pi * (8*self.alpha2*self.alpha2/45) * torch.sum(t*t)
+        if not self.return_fields:
+            return energy
 
         S_real_expanded = gaussian_factors * S_real
         S_imag_expanded = gaussian_factors * S_imag
