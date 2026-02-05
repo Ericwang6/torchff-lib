@@ -26,6 +26,84 @@ def _select_platform(requested: str | None) -> mm.Platform | None:
     return None
 
 
+def _get_ewald_params(system: mm.System, context: mm.Context) -> tuple[float, int]:
+    """Return (alpha, kmax) for the Ewald/PME NonbondedForce.
+
+    alpha is returned in units of 1/nm.  kmax is derived from the PME grid
+    dimensions as max(nx, ny, nz), which is a reasonable proxy for the
+    reciprocal-space resolution.
+    """
+    nb_force: mm.NonbondedForce | None = None
+    for f in system.getForces():
+        if isinstance(f, mm.NonbondedForce):
+            nb_force = f
+            break
+    if nb_force is None:
+        return float("nan"), 0
+
+    try:
+        alpha, nx, ny, nz = nb_force.getPMEParametersInContext(context)
+    except Exception:
+        alpha, nx, ny, nz = nb_force.getPMEParameters()
+
+    # alpha has dimensions of 1/length.
+    # alpha_inv_nm = alpha.value_in_unit(1.0 / unit.nanometer)
+    kmax = int(max(nx, ny, nz))
+    return alpha, kmax
+
+
+def run_openmm_water_md(
+    pdb: str,
+    steps: int = 100_000,
+    platform: str | None = None,
+    temperature: float = 300.0,
+) -> tuple[float, float, int]:
+    """Run a short NVE water simulation and return (ms/step, alpha, kmax).
+
+    This is a programmatic entry point that mirrors the CLI behaviour of this
+    script.  It is intended to be re-used by benchmarks such as
+    ``examples/fixed_charge_benchmark.py``.
+    """
+    # Load the PDB (assumed to be a pure water box)
+    pdb_file = app.PDBFile(pdb)
+
+    # Flexible TIP3P with PME (8 Å cutoff), no constraints.
+    forcefield = app.ForceField("tip3p.xml")
+
+    system = forcefield.createSystem(
+        pdb_file.topology,
+        nonbondedMethod=app.Ewald,
+        nonbondedCutoff=8.0 * unit.angstrom,
+        constraints=None,  # No constraints -> water not rigid
+        rigidWater=False,
+        removeCMMotion=True,
+    )
+
+    timestep = 0.001 * unit.picoseconds
+    integrator = mm.VerletIntegrator(timestep)
+
+    plat = _select_platform(platform)
+    if plat is not None:
+        simulation = app.Simulation(pdb_file.topology, system, integrator, plat)
+    else:
+        simulation = app.Simulation(pdb_file.topology, system, integrator)
+
+    simulation.context.setPositions(pdb_file.positions)
+    simulation.context.setPeriodicBoxVectors(*pdb_file.topology.getPeriodicBoxVectors())
+    simulation.context.setVelocitiesToTemperature(temperature * unit.kelvin)
+
+    # Extract Ewald/PME parameters for this configuration.
+    alpha, kmax = _get_ewald_params(system, simulation.context)
+
+    start_time = time.time()
+    simulation.step(steps)
+    end_time = time.time()
+
+    wall_seconds = end_time - start_time
+    ms_per_step = wall_seconds / steps * 1000.0 if steps > 0 else float("inf")
+    return ms_per_step, alpha, kmax
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -57,52 +135,22 @@ def main() -> None:
     )
 
     args = parser.parse_args()
-
-    # Load the PDB (assumed to be a pure water box)
-    pdb = app.PDBFile(args.pdb)
-
-    # Use a flexible water model: PME with 8 Å cutoff, no constraints, rigidWater=False
-    # tip3p.xml is bundled with OpenMM; it defines water nonbonded parameters.
-    forcefield = app.ForceField("tip3p.xml")
-
-    system = forcefield.createSystem(
-        pdb.topology,
-        nonbondedMethod=app.Ewald,
-        nonbondedCutoff=8.0 * unit.angstrom,
-        constraints=None,         # No constraints -> water not rigid
-        rigidWater=False,
-        removeCMMotion=True,
+    ms_per_step, alpha_inv_nm, kmax = run_openmm_water_md(
+        pdb=args.pdb,
+        steps=args.steps,
+        platform=args.platform,
+        temperature=args.temperature,
     )
 
-    # NVE integrator: plain Verlet with 0.001 ps timestep
-    timestep = 0.001 * unit.picoseconds
-    integrator = mm.VerletIntegrator(timestep)
-
-    platform = _select_platform(args.platform)
-    if platform is not None:
-        simulation = app.Simulation(pdb.topology, system, integrator, platform)
-    else:
-        simulation = app.Simulation(pdb.topology, system, integrator)
-
-    simulation.context.setPositions(pdb.positions)
-    simulation.context.setPeriodicBoxVectors(*pdb.topology.getPeriodicBoxVectors())
-    simulation.context.setVelocitiesToTemperature(args.temperature * unit.kelvin)
-
-    # Run the simulation and time it
-    start_time = time.time()
-    simulation.step(args.steps)
-    end_time = time.time()
-
-    wall_seconds = end_time - start_time
     simulated_ps = args.steps * 0.001  # timestep is 0.001 ps
-
-    # Convert to ns/day
+    wall_seconds = ms_per_step * args.steps / 1000.0 if ms_per_step != float("inf") else float("inf")
     simulated_ns = simulated_ps / 1000.0
     ns_per_day = simulated_ns * 86400.0 / wall_seconds if wall_seconds > 0 else float("inf")
 
     print(
         f"Simulated {simulated_ns:.3f} ns in {wall_seconds:.1f} s "
-        f"-> speed = {ns_per_day:.2f} ns/day ({wall_seconds/args.steps*1000:.2f} ms/step)"
+        f"-> speed = {ns_per_day:.2f} ns/day "
+        f"({ms_per_step:.2f} ms/step, alpha={alpha_inv_nm:.6f} 1/nm, kmax={kmax})"
     )
 
 

@@ -42,7 +42,28 @@ setup(
         build_cuda_extension('multipoles'),
         build_cuda_extension('ewald', ['ewald_optimized.cu']),
         build_cuda_extension('pme'),
-        build_cuda_extension('cmm')
+        build_cuda_extension('cmm'),
+        # only compile the fused nonbonded atom-pair kernel in csrc/nonbonded
+        CUDAExtension(
+            name='torchff_nb',
+            sources=['csrc/nonbonded/nonbonded_interface.cpp',
+                     'csrc/nonbonded/nonbonded_atom_pairs_cuda.cu'],
+            extra_compile_args={
+                'cxx': ['-O3'],
+                'nvcc': ['-O3'],
+            },
+            include_dirs=[os.path.join(os.path.dirname(__file__), "csrc")],
+        ),
+        CUDAExtension(
+            name='torchff_nblist',
+            sources=['csrc/nblist/nblist_interface.cpp',
+                     'csrc/nblist/nblist_nsquared_cuda.cu'],
+            extra_compile_args={
+                'cxx': ['-O3'],
+                'nvcc': ['-O3'],
+            },
+            include_dirs=[os.path.join(os.path.dirname(__file__), "csrc")],
+        ),
     ],
     cmdclass={
         'build_ext': BuildExtension

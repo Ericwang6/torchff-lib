@@ -1,5 +1,10 @@
 import torch
-import torchff_nb
+import torch.nn as nn
+
+import torchff_nb  # noqa: F401 - ensure CUDA extension is loaded
+
+from .coulomb import compute_coulomb_energy_ref
+from .vdw import compute_lennard_jones_energy_ref
 
 
 def compute_nonbonded_energy_from_atom_pairs(
@@ -9,18 +14,57 @@ def compute_nonbonded_energy_from_atom_pairs(
     sigma: torch.Tensor,
     epsilon: torch.Tensor,
     charges: torch.Tensor,
-    coul_constant: torch.Tensor,
+    coul_constant,
     cutoff: float,
-    do_shift: bool
-):
-    '''
-    Compute nonbonded interaction energies (fixed charge Coulomb and Lennard-Jones)
-    '''
+    do_shift: bool = True,
+) -> torch.Tensor:
+    """Compute fused Coulomb + Lennard-Jones nonbonded energies using custom CUDA/C++ ops."""
+    # CUDA kernel expects int64 index pairs
+    if pairs.dtype != torch.int64:
+        pairs = pairs.to(torch.int64)
     return torch.ops.torchff.compute_nonbonded_energy_from_atom_pairs(
-        coords, pairs, box,
-        sigma, epsilon, charges,
-        coul_constant, cutoff, do_shift
+        coords,
+        pairs,
+        box,
+        sigma,
+        epsilon,
+        charges,
+        coul_constant,
+        cutoff,
+        do_shift,
     )
+
+
+def compute_nonbonded_energy_from_atom_pairs_ref(
+    coords: torch.Tensor,
+    pairs: torch.Tensor,
+    box: torch.Tensor,
+    sigma: torch.Tensor,
+    epsilon: torch.Tensor,
+    charges: torch.Tensor,
+    coul_constant: float,
+    cutoff: float,
+    do_shift: bool = True,
+) -> torch.Tensor:
+    """Reference fused Coulomb + Lennard-Jones implementation using native PyTorch ops."""
+    ene_coul = compute_coulomb_energy_ref(
+        coords,
+        pairs,
+        box,
+        charges,
+        coul_constant,
+        cutoff,
+        do_shift,
+    )
+    ene_lj = compute_lennard_jones_energy_ref(
+        coords,
+        pairs,
+        box,
+        sigma,
+        epsilon,
+        cutoff,
+    )
+    return ene_coul + ene_lj
 
 
 def compute_nonbonded_forces_from_atom_pairs(
@@ -30,139 +74,67 @@ def compute_nonbonded_forces_from_atom_pairs(
     sigma: torch.Tensor,
     epsilon: torch.Tensor,
     charges: torch.Tensor,
-    coul_constant: torch.Tensor,
+    coul_constant: float,
     cutoff: float,
-    forces: torch.Tensor
-):
-    '''
-    Compute nonbonded forces (fixed charge Coulomb and Lennard-Jones) in-place, only used for fast-MD, 
-    backward calculation is not supported
-    '''
+    forces: torch.Tensor,
+) -> torch.Tensor:
+    """Compute fused Coulomb + Lennard-Jones nonbonded forces in-place using custom CUDA/C++ ops."""
+    if pairs.dtype != torch.int64:
+        pairs = pairs.to(torch.int64)
     return torch.ops.torchff.compute_nonbonded_forces_from_atom_pairs(
-        coords, pairs, box,
-        sigma, epsilon, charges,
-        coul_constant, cutoff, forces
-    )
-
-
-def compute_nonbonded_energy_from_cluster_pairs(
-    coords,
-    box,
-    sigma,
-    epsilon,
-    charges,
-    coul_constant,
-    cutoff,
-    sorted_atom_indices,
-    cluster_exclusions,
-    bitmask_exclusions,
-    interacting_clusters,
-    interacting_atoms,
-    do_shift
-):
-    '''
-    Compute nonbonded interaction energies from cluster pairs (fixed charge Coulomb and Lennard-Jones)
-    '''
-    return torch.ops.torchff.compute_nonbonded_energy_from_cluster_pairs(
         coords,
+        pairs,
         box,
         sigma,
         epsilon,
         charges,
         coul_constant,
         cutoff,
-        sorted_atom_indices,
-        cluster_exclusions,
-        bitmask_exclusions,
-        interacting_clusters,
-        interacting_atoms,
-        do_shift
+        forces,
     )
 
 
-def compute_nonbonded_forces_from_cluster_pairs(
-    coords,
-    box,
-    sigma,
-    epsilon,
-    charges,
-    coul_constant,
-    cutoff,
-    sorted_atom_indices,
-    cluster_exclusions,
-    bitmask_exclusions,
-    interacting_clusters,
-    interacting_atoms,
-    forces
-):
-    '''
-    Compute nonbonded interaction energies from cluster pairs (fixed charge Coulomb and Lennard-Jones)
-    '''
-    return torch.ops.torchff.compute_nonbonded_forces_from_cluster_pairs(
-        coords,
-        box,
-        sigma,
-        epsilon,
-        charges,
-        coul_constant,
-        cutoff,
-        sorted_atom_indices,
-        cluster_exclusions,
-        bitmask_exclusions,
-        interacting_clusters,
-        interacting_atoms,
-        forces
-    )
+class Nonbonded(nn.Module):
+    """Fused fixed-charge nonbonded (Coulomb + Lennard-Jones) interaction."""
 
+    def __init__(self, use_customized_ops: bool = False):
+        super().__init__()
+        self.use_customized_ops = use_customized_ops
 
-# def compute_nonbonded_energy_from_cluster_pairs(
-#     coords: torch.Tensor,
-#     box: torch.Tensor,
-#     sigma: torch.Tensor,
-#     epsilon: torch.Tensor,
-#     charges: torch.Tensor,
-#     coul_constant: torch.Tensor,
-#     cutoff: float,
-#     sorted_atom_indices: torch.Tensor,
-#     interacting_clusters: torch.Tensor,
-#     bitmask_exclusions: torch.Tensor,
-#     do_shift: bool
-# ):
-#     '''
-#     Compute nonbonded interaction energies (fixed charge Coulomb and Lennard-Jones)
-#     '''
-#     return torch.ops.torchff.compute_nonbonded_energy_from_cluster_pairs(
-#         coords, box,
-#         sigma, epsilon, charges,
-#         coul_constant,
-#         cutoff,
-#         sorted_atom_indices, interacting_clusters, bitmask_exclusions,
-#         do_shift
-#     )
-    
+    def forward(
+        self,
+        coords: torch.Tensor,
+        pairs: torch.Tensor,
+        box: torch.Tensor,
+        sigma: torch.Tensor,
+        epsilon: torch.Tensor,
+        charges: torch.Tensor,
+        coul_constant: float,
+        cutoff: float,
+        do_shift: bool = True,
+    ) -> torch.Tensor:
+        if self.use_customized_ops:
+            return compute_nonbonded_energy_from_atom_pairs(
+                coords,
+                pairs,
+                box,
+                sigma,
+                epsilon,
+                charges,
+                coul_constant,
+                cutoff,
+                do_shift,
+            )
+        else:
+            return compute_nonbonded_energy_from_atom_pairs_ref(
+                coords,
+                pairs,
+                box,
+                sigma,
+                epsilon,
+                charges,
+                coul_constant,
+                cutoff,
+                do_shift,
+            )
 
-# def compute_nonbonded_forces_from_cluster_pairs(
-#     coords: torch.Tensor,
-#     box: torch.Tensor,
-#     sigma: torch.Tensor,
-#     epsilon: torch.Tensor,
-#     charges: torch.Tensor,
-#     coul_constant: torch.Tensor,
-#     cutoff: float,
-#     sorted_atom_indices: torch.Tensor,
-#     interacting_clusters: torch.Tensor,
-#     bitmask_exclusions: torch.Tensor,
-#     forces: torch.Tensor
-# ):
-#     '''
-#     Compute nonbonded forces (fixed charge Coulomb and Lennard-Jones) in-place, only used for fast-MD, 
-#     backward calculation is not supported
-#     '''
-#     return torch.ops.torchff.compute_nonbonded_forces_from_cluster_pairs(
-#         coords, box,
-#         sigma, epsilon, charges,
-#         coul_constant,
-#         cutoff,
-#         sorted_atom_indices, interacting_clusters, bitmask_exclusions,
-#         forces
-#     )

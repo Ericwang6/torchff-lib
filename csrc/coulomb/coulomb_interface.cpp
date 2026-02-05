@@ -3,7 +3,7 @@
 #include <torch/extension.h>
 
 TORCH_LIBRARY_FRAGMENT(torchff, m) {
-    m.def("compute_coulomb_energy(Tensor coords, Tensor pairs, Tensor box, Tensor charges, Tensor prefac, Scalar cutoff, bool do_shift) -> Tensor");
+    m.def("compute_coulomb_energy(Tensor coords, Tensor pairs, Tensor box, Tensor charges, Scalar coulomb_constant, Scalar cutoff, bool do_shift) -> Tensor");
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

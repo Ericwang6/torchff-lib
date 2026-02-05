@@ -10,20 +10,20 @@
 
 #include "common/vec3.cuh"
 #include "common/pbc.cuh"
+#include "common/reduce.cuh"
 
 
-template <typename scalar_t>
+template <typename scalar_t, int BLOCK_SIZE, bool DO_SHIFT>
 __global__ void coulomb_cuda_kernel(
     scalar_t* coords,
-    int32_t* pairs, 
+    int64_t* pairs, 
     scalar_t* g_box,
     scalar_t* g_box_inv,
     scalar_t cutoff,
-    scalar_t prefac,
+    scalar_t coulomb_constant,
     scalar_t* charges,
-    scalar_t do_shift,  // 1 if shift to rcut else 0
-    int32_t npairs,
-    scalar_t* ene, 
+    int64_t npairs,
+    scalar_t* ene_out, 
     scalar_t* coord_grad, 
     scalar_t* charge_grad
 ) {
@@ -38,49 +38,65 @@ __global__ void coulomb_cuda_kernel(
 
     __syncthreads();
 
-    int32_t index = threadIdx.x + blockIdx.x * blockDim.x;
-    if (index >= npairs) {
-        return;
-    }
-    int32_t i = pairs[index * 2];
-    int32_t j = pairs[index * 2 + 1];
-    int32_t offset_i = 3 * i;
-    int32_t offset_j = 3 * j;
-    scalar_t rij[3];
-    scalar_t tmp[3];
-    diff_vec3(&coords[offset_i], &coords[offset_j], tmp);
-    apply_pbc_triclinic(tmp, box, box_inv, rij);
+    scalar_t ene = static_cast<scalar_t>(0.0);
 
-    tmp[0] = norm_vec3(rij);
-    
-    if ( tmp[0] > cutoff ) {
-        ene[index] = 0.0;
-        return;
-    }
-    else {
-        scalar_t rinv = 1 / tmp[0];
-        scalar_t rinv3 = pow(rinv, 3);
+    for (int64_t index = threadIdx.x + blockIdx.x * BLOCK_SIZE;
+         index < npairs;
+         index += BLOCK_SIZE * gridDim.x) {
+
+        int64_t i = pairs[index * 2];
+        int64_t j = pairs[index * 2 + 1];
+        int64_t offset_i = 3 * i;
+        int64_t offset_j = 3 * j;
+        scalar_t rij[3];
+        scalar_t tmp[3];
+        diff_vec3(&coords[offset_i], &coords[offset_j], tmp);
+        apply_pbc_triclinic(tmp, box, box_inv, rij);
+
+        tmp[0] = norm_vec3(rij);
+        
+        if (tmp[0] > cutoff) {
+            continue;
+        }
+
+        scalar_t rinv = static_cast<scalar_t>(1.0) / tmp[0];
+        scalar_t rinv2 = rinv * rinv;
+        scalar_t rinv3 = rinv2 * rinv;
         scalar_t ci = charges[i];
         scalar_t cj = charges[j];
 
-        scalar_t p = prefac * ci * cj;
+        scalar_t p = coulomb_constant * ci * cj;
 
         // Energy 
-        scalar_t e = p * (rinv - do_shift / cutoff);
-        ene[index] = e;
-
-        // Coordinate gradients
-        for (int d = 0; d < 3; d++) {
-            scalar_t g = p * rinv3 * rij[d];
-            atomicAdd(&coord_grad[offset_i + d], -g);
-            atomicAdd(&coord_grad[offset_j + d],  g);
+        scalar_t e_pair;
+        if constexpr (DO_SHIFT) {
+            e_pair = p * (rinv - static_cast<scalar_t>(1.0) / cutoff);
+        } else {
+            e_pair = p * rinv;
         }
+        ene += e_pair;
 
         // Charge gradients
-        atomicAdd(&charge_grad[i], e / ci);
-        atomicAdd(&charge_grad[j], e / cj);
-        
-        return;
+        if (charge_grad) {
+            atomicAdd(&charge_grad[i], e_pair / ci);
+            atomicAdd(&charge_grad[j], e_pair / cj);
+        }
+
+        // Coordinate gradients
+        if (coord_grad) {
+            scalar_t g_coeff = p * rinv3;
+            scalar_t g;
+            #pragma unroll
+            for (int d = 0; d < 3; d++) {
+                g = g_coeff * rij[d];
+                atomicAdd(&coord_grad[offset_i + d], -g);
+                atomicAdd(&coord_grad[offset_j + d],  g);
+            }
+        }
+    }
+
+    if (ene_out) {
+        block_reduce_sum<scalar_t, BLOCK_SIZE>(ene, ene_out);
     }
 }
 
@@ -94,41 +110,62 @@ public:
         at::Tensor& pairs,
         at::Tensor& box,
         at::Tensor& charges,
-        at::Tensor& prefac,
+        at::Scalar coulomb_constant,
         at::Scalar cutoff,
         bool do_shift
     ) {
-        int32_t npairs = pairs.size(0);
-        int32_t block_dim = 256;
-        int32_t grid_dim = (npairs + block_dim - 1) / block_dim;
+        int64_t npairs = pairs.size(0);
 
-        at::Tensor ene = at::empty({npairs}, coords.options());
-        at::Tensor coord_grad = at::zeros_like(coords, coords.options());
-        at::Tensor charges_grad = at::zeros_like(charges, coords.options());
-        at::Tensor box_inv = at::linalg_inv(box);
-        at::Scalar p = prefac.item();
-
+        auto props = at::cuda::getCurrentDeviceProperties();
         auto stream = at::cuda::getCurrentCUDAStream();
+        constexpr int BLOCK_SIZE = 256;
+        int GRID_SIZE = std::min(
+            static_cast<int>((npairs + BLOCK_SIZE - 1) / BLOCK_SIZE),
+            props->multiProcessorCount * props->maxBlocksPerMultiProcessor
+        );
+
+        at::Tensor ene = at::zeros({1}, coords.options());
+        at::Tensor coord_grad = at::zeros_like(coords, coords.options());
+        at::Tensor charges_grad = at::zeros_like(charges, charges.options());
+        at::Tensor box_inv = at::linalg_inv(box);
+
         AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "compute_coulomb", ([&] {
-            scalar_t shift = do_shift ? 1.0 : 0.0;
-            coulomb_cuda_kernel<scalar_t><<<grid_dim, block_dim, 0, stream>>>(
-                coords.data_ptr<scalar_t>(),
-                pairs.data_ptr<int32_t>(),
-                box.data_ptr<scalar_t>(),
-                box_inv.data_ptr<scalar_t>(),
-                cutoff.to<scalar_t>(),
-                p.to<scalar_t>(),
-                charges.data_ptr<scalar_t>(),
-                shift,
-                npairs,
-                ene.data_ptr<scalar_t>(),
-                coord_grad.data_ptr<scalar_t>(),
-                charges_grad.data_ptr<scalar_t>()
-            );
+            const scalar_t cutoff_val = cutoff.to<scalar_t>();
+            const scalar_t coulomb_constant_val = coulomb_constant.to<scalar_t>();
+
+            if (do_shift) {
+                coulomb_cuda_kernel<scalar_t, BLOCK_SIZE, true><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(
+                    coords.data_ptr<scalar_t>(),
+                    pairs.data_ptr<int64_t>(),
+                    box.data_ptr<scalar_t>(),
+                    box_inv.data_ptr<scalar_t>(),
+                    cutoff_val,
+                    coulomb_constant_val,
+                    charges.data_ptr<scalar_t>(),
+                    npairs,
+                    ene.data_ptr<scalar_t>(),
+                    coords.requires_grad() ? coord_grad.data_ptr<scalar_t>() : nullptr,
+                    charges.requires_grad() ? charges_grad.data_ptr<scalar_t>() : nullptr
+                );
+            } else {
+                coulomb_cuda_kernel<scalar_t, BLOCK_SIZE, false><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(
+                    coords.data_ptr<scalar_t>(),
+                    pairs.data_ptr<int64_t>(),
+                    box.data_ptr<scalar_t>(),
+                    box_inv.data_ptr<scalar_t>(),
+                    cutoff_val,
+                    coulomb_constant_val,
+                    charges.data_ptr<scalar_t>(),
+                    npairs,
+                    ene.data_ptr<scalar_t>(),
+                    coords.requires_grad() ? coord_grad.data_ptr<scalar_t>() : nullptr,
+                    charges.requires_grad() ? charges_grad.data_ptr<scalar_t>() : nullptr
+                );
+            }
         }));
-        at::Tensor e = at::sum(ene);
-        ctx->save_for_backward({coord_grad, charges_grad, e, prefac});
-        return e;
+
+        ctx->save_for_backward({coord_grad, charges_grad});
+        return ene;
     }
 
     static std::vector<at::Tensor> backward(
@@ -142,7 +179,7 @@ public:
             ignore, 
             ignore,
             saved[1] * grad_outputs[0], 
-            saved[2] / saved[3] * grad_outputs[0],
+            ignore,
             ignore,
             ignore
         };
@@ -156,11 +193,11 @@ at::Tensor compute_coulomb_energy_cuda(
     at::Tensor& pairs,
     at::Tensor& box,
     at::Tensor& charges,
-    at::Tensor& prefac,
+    at::Scalar coulomb_constant,
     at::Scalar cutoff,
     bool do_shift
 ) {
-    return CoulombFunctionCuda::apply(coords, pairs, box, charges, prefac, cutoff, do_shift);
+    return CoulombFunctionCuda::apply(coords, pairs, box, charges, coulomb_constant, cutoff, do_shift);
 }
 
 

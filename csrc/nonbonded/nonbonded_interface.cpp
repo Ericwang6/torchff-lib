@@ -4,10 +4,10 @@
 TORCH_LIBRARY_FRAGMENT(torchff, m) {
     // m.def("compute_nonbonded_energy_from_cluster_pairs(Tensor coords, Tensor box, Tensor sigma, Tensor epsilon, Tensor charges, Tensor coul_constant, Scalar cutoff, Tensor sorted_atom_indices, Tensor interacting_clusters, Tensor bitmask_exclusions, bool do_shift) -> Tensor");
     // m.def("compute_nonbonded_forces_from_cluster_pairs(Tensor coords, Tensor box, Tensor sigma, Tensor epsilon, Tensor charges, Tensor coul_constant, Scalar cutoff, Tensor sorted_atom_indices, Tensor interacting_clusters, Tensor bitmask_exclusions, Tensor forces) -> ()");
-    m.def("compute_nonbonded_energy_from_cluster_pairs(Tensor coords, Tensor box, Tensor sigma, Tensor epsilon, Tensor charges, Tensor coul_constant, Scalar cutoff, Tensor sorted_atom_indices, Tensor cluster_exclusions, Tensor bitmask_exclusions, Tensor interacting_clusters, Tensor interacting_atoms, bool do_shift) -> Tensor");
-    m.def("compute_nonbonded_forces_from_cluster_pairs(Tensor coords, Tensor box, Tensor sigma, Tensor epsilon, Tensor charges, Tensor coul_constant, Scalar cutoff, Tensor sorted_atom_indices, Tensor cluster_exclusions, Tensor bitmask_exclusions, Tensor interacting_clusters, Tensor interacting_atoms, Tensor forces) -> ()");
-    m.def("compute_nonbonded_energy_from_atom_pairs(Tensor coords, Tensor pairs, Tensor box, Tensor sigma, Tensor epsilon, Tensor charges, Tensor coul_constant, Scalar cutoff, bool do_shift) -> Tensor");
-    m.def("compute_nonbonded_forces_from_atom_pairs(Tensor coords, Tensor pairs, Tensor box, Tensor sigma, Tensor epsilon, Tensor charges, Tensor coul_constant, Scalar cutoff, Tensor forces) -> ()");
+    // m.def("compute_nonbonded_energy_from_cluster_pairs(Tensor coords, Tensor box, Tensor sigma, Tensor epsilon, Tensor charges, Tensor coul_constant, Scalar cutoff, Tensor sorted_atom_indices, Tensor cluster_exclusions, Tensor bitmask_exclusions, Tensor interacting_clusters, Tensor interacting_atoms, bool do_shift) -> Tensor");
+    // m.def("compute_nonbonded_forces_from_cluster_pairs(Tensor coords, Tensor box, Tensor sigma, Tensor epsilon, Tensor charges, Tensor coul_constant, Scalar cutoff, Tensor sorted_atom_indices, Tensor cluster_exclusions, Tensor bitmask_exclusions, Tensor interacting_clusters, Tensor interacting_atoms, Tensor forces) -> ()");
+    m.def("compute_nonbonded_energy_from_atom_pairs(Tensor coords, Tensor pairs, Tensor box, Tensor sigma, Tensor epsilon, Tensor charges, Scalar coul_constant, Scalar cutoff, bool do_shift) -> Tensor");
+    m.def("compute_nonbonded_forces_from_atom_pairs(Tensor coords, Tensor pairs, Tensor box, Tensor sigma, Tensor epsilon, Tensor charges, Scalar coul_constant, Scalar cutoff, Tensor forces) -> ()");
 }
 
 PYBIND11_MODULE(torchff_nb, m) {

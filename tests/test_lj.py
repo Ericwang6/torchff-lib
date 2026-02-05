@@ -1,107 +1,131 @@
 import pytest
-import time
-import numpy as np
 import torch
-import torch.nn as nn
-import torchff
+
+from .utils import perf_op, check_op
+from .get_reference import get_water_data
+from torchff.vdw import LennardJones
 
 
-@torch.compile
-class LennardJones(nn.Module):
-
-    def forward(self, coords, pairs, box, sigma, epsilon, cutoff):
-        # box in row major: [[ax, ay, az], [bx, by, bz], [cx, cy, cz]]
-        drVecs = coords[pairs[:, 0]] - coords[pairs[:, 1]]
-        boxInv = torch.linalg.inv(box)
-        dsVecs = torch.matmul(drVecs, boxInv)
-        dsVecsPBC = dsVecs - torch.floor(dsVecs + 0.5)
-        drVecsPBC = torch.matmul(dsVecsPBC, box)
-        dr = torch.norm(drVecsPBC, dim=1)
-        mask = dr <= cutoff
-        sigma_ij = (sigma[pairs[:, 0]] + sigma[pairs[:, 1]]) / 2
-        epsilon_ij = torch.sqrt(epsilon[pairs[:, 0]] * epsilon[pairs[:, 1]])
-        tmp = (sigma_ij / dr) ** 6
-        ene = 4 * epsilon_ij * tmp * (tmp - 1)
-        return torch.sum(ene * mask)
+def _build_lj_pairs(num_atoms: int, device: str) -> torch.Tensor:
+    """
+    Very simple neighbor list: all unique atom pairs (i < j).
+    This is O(N^2) and meant only for test sizes.
+    """
+    # Use torch.combinations to generate all unordered pairs.
+    idx = torch.arange(num_atoms, device=device, dtype=torch.int64)
+    pairs = torch.combinations(idx, r=2)
+    return pairs
 
 
-@pytest.mark.parametrize("device, dtype, requires_grad", [
-    # ('cpu', torch.float64), 
-    # ('cpu', torch.float32), 
-    ('cuda', torch.float32, False),
-    ('cuda', torch.float64, False), 
-])
-def test_harmonic_bond(device, dtype, requires_grad):
-    cutoff = 4.0
+def _create_lj_test_data(
+    num_waters: int,
+    cutoff: float,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.float64,
+):
+    """
+    Create Lennard-Jones test data from the water reference system.
+    Uses OpenMM-derived coordinates, box, sigma, epsilon from TIP3P.
+    """
+    wd = get_water_data(
+        n=num_waters,
+        cutoff=cutoff,
+        dtype=dtype,
+        device=device,
+        coord_grad=True,
+        box_grad=True,
+        param_grad=True,
+    )
 
-    box = torch.tensor([
-        [10.0, 0.0, 0.0],
-        [0.0, 10.0, 0.0],
-        [0.0, 0.0, 10.0]
-    ], requires_grad=False, dtype=dtype, device=device)
-    
-    N = 30000
-    coords = (np.random.rand(N, 3) * 10.0).tolist()
-    coords = torch.tensor(coords, requires_grad=requires_grad, device=device, dtype=dtype)
-    # coords = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.5]], requires_grad=requires_grad, device=device, dtype=dtype)
+    # coords: (Natoms, 3) in nm, box: (3, 3) in nm
+    coords = wd.coords
+    box = wd.box
+    sigma = wd.sigma
+    epsilon = wd.epsilon
 
-    Npairs = 15000000
-    pairs = torch.randint(0, N-2, (Npairs, 2), device=device, dtype=torch.int32)
-    pairs[:, 1] = pairs[:, 0] + 1
-    # pairs = torch.tensor([[0, 1]], dtype=torch.long, device=device)
+    pairs = _build_lj_pairs(coords.shape[0], device=device)
 
-    sigma = (np.random.rand(N) * 0.3 + 0.001).tolist()
-    sigma = torch.tensor(sigma, device=device, dtype=dtype, requires_grad=requires_grad)
+    return coords, box, sigma, epsilon, pairs
 
-    epsilon = (np.random.rand(N) + 0.001).tolist()
-    epsilon = torch.tensor(epsilon, device=device, dtype=dtype, requires_grad=requires_grad)
 
-    lj = LennardJones()
-    ene_ref = lj(coords, pairs, box, sigma, epsilon, cutoff)
-    ene = torchff.compute_lennard_jones_energy(coords, pairs, box, sigma, epsilon, cutoff)
+@pytest.mark.dependency()
+@pytest.mark.parametrize("device, dtype", [("cuda", torch.float32), ("cuda", torch.float64)])
+def test_lennard_jones_energy(device, dtype):
+    """
+    Compare custom CUDA Lennard-Jones kernel against Python reference implementation.
+    """
+    cutoff = 0.4  # in nm, consistent with water reference setup
+    num_waters = 100
 
-    assert torch.allclose(ene_ref, ene), 'Energy not the same'
+    coords, box, sigma, epsilon, pairs = _create_lj_test_data(
+        num_waters=num_waters,
+        cutoff=cutoff,
+        device=device,
+        dtype=dtype,
+    )
 
-    if requires_grad:
-        ene_ref.backward()
-        grads_ref = [coords.grad.clone().detach(), sigma.grad.clone().detach(), epsilon.grad.clone().detach()]
+    func = LennardJones(use_customized_ops=True).to(device=device, dtype=dtype)
+    func_ref = LennardJones(use_customized_ops=False).to(device=device, dtype=dtype)
 
-        coords.grad.zero_()
-        sigma.grad.zero_()
-        epsilon.grad.zero_()
+    check_op(
+        func,
+        func_ref,
+        {
+            "coords": coords,
+            "pairs": pairs,
+            "box": box,
+            "sigma": sigma,
+            "epsilon": epsilon,
+            "cutoff": cutoff,
+        },
+        check_grad=True,
+        atol=1e-6 if dtype is torch.float64 else 1e-4,
+        rtol=1e-5,
+    )
 
-        ene.backward()
-        grads = [coords.grad.clone().detach(), sigma.grad.clone().detach(), epsilon.grad.clone().detach()]
 
-        for c, g, gref in zip(['coord', 'sigma', 'epsilon'], grads, grads_ref):
-            assert torch.allclose(g, gref, atol=1e-5), f'Gradient {c} not the same (max deviation {torch.max(torch.abs(g - gref))})'
+@pytest.mark.parametrize("device, dtype", [("cuda", torch.float32), ("cuda", torch.float64)])
+def test_perf_lennard_jones(device, dtype):
+    """
+    Performance comparison between Python and custom CUDA Lennard-Jones implementations.
+    """
+    cutoff = 0.4  # in nm
+    num_waters = 300  # modest size for perf test
 
-    # Test times
-    Ntimes = 1000
-    
-    if requires_grad:
-        start = time.time()
-        for _ in range(Ntimes):
-            ene = torchff.compute_lennard_jones_energy(coords, pairs, box, sigma, epsilon, cutoff)
-            ene.backward()
-        end = time.time()
-        print(f"torchff time: {(end-start)/Ntimes*1000:.5f} ms")
+    coords, box, sigma, epsilon, pairs = _create_lj_test_data(
+        num_waters=num_waters,
+        cutoff=cutoff,
+        device=device,
+        dtype=dtype,
+    )
 
-        start = time.time()
-        for _ in range(Ntimes):
-            ene_ref = lj(coords, pairs, box, sigma, epsilon, cutoff)
-            ene_ref.backward()
-        end = time.time()
-        print(f"torch time: {(end-start)/Ntimes*1000:.5f} ms")
-    else:
-        start = time.time()
-        for _ in range(Ntimes):
-            ene = torchff.compute_lennard_jones_energy(coords, pairs, box, sigma, epsilon, cutoff)
-        end = time.time()
-        print(f"torchff time: {(end-start)/Ntimes*1000:.5f} ms")
+    func_ref = torch.compile(
+        LennardJones(use_customized_ops=False)
+    ).to(device=device, dtype=dtype)
+    func = LennardJones(use_customized_ops=True).to(device=device, dtype=dtype)
 
-        start = time.time()
-        for _ in range(Ntimes):
-            ene_ref = lj(coords, pairs, box, sigma, epsilon, cutoff)
-        end = time.time()
-        print(f"torch time: {(end-start)/Ntimes*1000:.5f} ms")
+    perf_op(
+        func_ref,
+        coords,
+        pairs,
+        box,
+        sigma,
+        epsilon,
+        cutoff,
+        desc=f"lj_ref (N={coords.shape[0]})",
+        repeat=100,
+        run_backward=True,
+    )
+    perf_op(
+        func,
+        coords,
+        pairs,
+        box,
+        sigma,
+        epsilon,
+        cutoff,
+        desc=f"lj_torchff (N={coords.shape[0]})",
+        repeat=100,
+        run_backward=True,
+    )
+

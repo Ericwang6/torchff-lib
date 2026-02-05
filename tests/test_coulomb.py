@@ -1,106 +1,133 @@
 import pytest
-import time
-import numpy as np
 import torch
-import torch.nn as nn
-import torchff
+
+from .utils import perf_op, check_op
+from .get_reference import get_water_data
+from torchff.coulomb import Coulomb
 
 
-@torch.compile
-class Coulomb(nn.Module):
-
-    def forward(self, coords, pairs, box, charges, prefac, cutoff, do_shift=True):
-        # box in row major: [[ax, ay, az], [bx, by, bz], [cx, cy, cz]]
-        drVecs = coords[pairs[:, 0]] - coords[pairs[:, 1]]
-        boxInv = torch.linalg.inv(box)
-        dsVecs = torch.matmul(drVecs, boxInv)
-        dsVecsPBC = dsVecs - torch.floor(dsVecs + 0.5)
-        drVecsPBC = torch.matmul(dsVecsPBC, box)
-        dr = torch.norm(drVecsPBC, dim=1)
-        mask = dr <= cutoff
-        rinv = 1 / dr
-        if do_shift:
-            rinv -= 1 / cutoff
-        ene = charges[pairs[:, 0]] * charges[pairs[:, 1]]* rinv
-        return torch.sum(ene * mask) * prefac
+def _build_coulomb_pairs(num_atoms: int, device: str) -> torch.Tensor:
+    """
+    Very simple neighbor list: all unique atom pairs (i < j).
+    This is O(N^2) and meant only for test sizes.
+    """
+    idx = torch.arange(num_atoms, device=device, dtype=torch.int64)
+    pairs = torch.combinations(idx, r=2)
+    return pairs
 
 
-@pytest.mark.parametrize("device, dtype, requires_grad", [
-    # ('cpu', torch.float64), 
-    # ('cpu', torch.float32), 
-    ('cuda', torch.float32, True),
-    ('cuda', torch.float64, True), 
-])
-def test_coulomb(device, dtype, requires_grad):
-    cutoff = 4.0
+def _create_coulomb_test_data(
+    num_waters: int,
+    cutoff: float,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.float64,
+):
+    """
+    Create Coulomb test data from the water reference system.
+    Uses OpenMM-derived coordinates, box, and charges from TIP3P.
+    """
+    wd = get_water_data(
+        n=num_waters,
+        cutoff=cutoff,
+        dtype=dtype,
+        device=device,
+        coord_grad=True,
+        box_grad=True,
+        param_grad=True,
+    )
 
-    box = torch.tensor([
-        [10.0, 0.0, 0.0],
-        [0.0, 10.0, 0.0],
-        [0.0, 0.0, 10.0]
-    ], requires_grad=False, dtype=dtype, device=device)
-    
-    N = 100000
-    coords = (np.random.rand(N, 3) * 10.0).tolist()
-    coords = torch.tensor(coords, requires_grad=requires_grad, device=device, dtype=dtype)
+    # coords: (Natoms, 3) in nm, box: (3, 3) in nm
+    coords = wd.coords
+    box = wd.box
+    charges = wd.charges
 
-    charges = (np.random.rand(N) + 0.001).tolist()
-    charges = torch.tensor(charges, requires_grad=requires_grad, device=device, dtype=dtype)
-    # coords = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.5]], requires_grad=requires_grad, device=device, dtype=dtype)
+    pairs = _build_coulomb_pairs(coords.shape[0], device=device)
 
-    Npairs = 100000
-    pairs = torch.randint(0, N-2, (Npairs, 2), device=device, dtype=torch.int32)
-    pairs[:, 1] = pairs[:, 0] + 1
-    # pairs = torch.tensor([[0, 1]], dtype=torch.long, device=device)
+    return coords, box, charges, pairs
 
-    prefac = torch.tensor(20.0, device=device, requires_grad=requires_grad, dtype=dtype)
 
-    coul = Coulomb()
-    ene_ref = coul(coords, pairs, box, charges, prefac, cutoff)
-    ene = torchff.compute_coulomb_energy(coords, pairs, box, charges, prefac, cutoff)
+@pytest.mark.dependency()
+@pytest.mark.parametrize("device, dtype", [("cuda", torch.float32), ("cuda", torch.float64)])
+def test_coulomb_energy(device, dtype):
+    """
+    Compare custom CUDA Coulomb kernel against Python reference implementation.
+    """
+    cutoff = 0.4  # in nm, consistent with water reference setup
+    num_waters = 100
 
-    assert torch.allclose(ene_ref, ene), 'Energy not the same'
+    coords, box, charges, pairs = _create_coulomb_test_data(
+        num_waters=num_waters,
+        cutoff=cutoff,
+        device=device,
+        dtype=dtype,
+    )
 
-    if requires_grad:
-        ene_ref.backward()
-        grads_ref = [coords.grad.clone().detach(), charges.grad.clone().detach() , prefac.grad.clone().detach()]
+    # Coulomb prefactor in kJ/mol·nm·e^-2 (can be any scalar since both implementations share it)
+    coulomb_constant = 138.935456
 
-        coords.grad.zero_()
-        charges.grad.zero_()
-        prefac.grad.zero_()
+    func = Coulomb(use_customized_ops=True).to(device=device, dtype=dtype)
+    func_ref = Coulomb(use_customized_ops=False).to(device=device, dtype=dtype)
 
-        ene.backward()
-        grads = [coords.grad.clone().detach(), charges.grad.clone().detach(), prefac.grad.clone().detach()]
+    check_op(
+        func,
+        func_ref,
+        {
+            "coords": coords,
+            "pairs": pairs,
+            "box": box,
+            "charges": charges,
+            "coulomb_constant": coulomb_constant,
+            "cutoff": cutoff,
+        },
+        check_grad=True,
+        atol=1e-6 if dtype is torch.float64 else 1e-4,
+        rtol=1e-5,
+    )
 
-        for c, g, gref in zip(['coord', 'charge', 'prefac'], grads, grads_ref):
-            assert torch.allclose(g, gref, atol=1e-5), f'Gradient {c} not the same (max deviation {torch.max(torch.abs(g - gref))})'
 
-    # Test times
-    Ntimes = 1000
-    
-    if requires_grad:
-        start = time.time()
-        for _ in range(Ntimes):
-            ene = torchff.compute_coulomb_energy(coords, pairs, box, charges, prefac, cutoff)
-            ene.backward()
-        end = time.time()
-        print(f"torchff time: {(end-start)/Ntimes*1000:.5f} ms")
+@pytest.mark.parametrize("device, dtype", [("cuda", torch.float32), ("cuda", torch.float64)])
+def test_perf_coulomb(device, dtype):
+    """
+    Performance comparison between Python and custom CUDA Coulomb implementations.
+    """
+    cutoff = 0.4  # in nm
+    num_waters = 300  # modest size for perf test
 
-        start = time.time()
-        for _ in range(Ntimes):
-            ene_ref = coul(coords, pairs, box, charges, prefac, cutoff)
-            ene_ref.backward()
-        end = time.time()
-        print(f"torch time: {(end-start)/Ntimes*1000:.5f} ms")
-    else:
-        start = time.time()
-        for _ in range(Ntimes):
-            ene = torchff.compute_coulomb_energy(coords, pairs, box, charges, prefac, cutoff)
-        end = time.time()
-        print(f"torchff time: {(end-start)/Ntimes*1000:.5f} ms")
+    coords, box, charges, pairs = _create_coulomb_test_data(
+        num_waters=num_waters,
+        cutoff=cutoff,
+        device=device,
+        dtype=dtype,
+    )
 
-        start = time.time()
-        for _ in range(Ntimes):
-            ene_ref = coul(coords, pairs, box, charges, prefac, cutoff)
-        end = time.time()
-        print(f"torch time: {(end-start)/Ntimes*1000:.5f} ms")
+    coulomb_constant = 138.935456
+
+    func_ref = torch.compile(
+        Coulomb(use_customized_ops=False)
+    ).to(device=device, dtype=dtype)
+    func = Coulomb(use_customized_ops=True).to(device=device, dtype=dtype)
+
+    perf_op(
+        func_ref,
+        coords,
+        pairs,
+        box,
+        charges,
+        coulomb_constant,
+        cutoff,
+        desc=f"coulomb_ref (N={coords.shape[0]})",
+        repeat=100,
+        run_backward=True,
+    )
+    perf_op(
+        func,
+        coords,
+        pairs,
+        box,
+        charges,
+        coulomb_constant,
+        cutoff,
+        desc=f"coulomb_torchff (N={coords.shape[0]})",
+        repeat=100,
+        run_backward=True,
+    )
