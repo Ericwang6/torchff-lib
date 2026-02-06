@@ -1,47 +1,47 @@
-import math
+import os
 import numpy as np
 import pytest
 import torch
 
+from .utils import perf_op, check_op
 from torchff.pme import PME
 
 
 torch.set_printoptions(precision=8)
+torch.set_default_dtype(torch.float64)
 
 
 def create_test_data(num: int, rank: int = 2, device: str = "cuda", dtype: torch.dtype = torch.float64):
-    """Create random test data for PME tests."""
-    # Set a physically reasonable box length scaling with number of atoms
-    boxLen = float((num * 10.0) ** (1.0 / 3.0))
-
-    # Random coordinates in [0, boxLen)
-    coords_np = np.random.rand(num, 3) * boxLen
-
-    # Random charges, shifted so that the total charge is zero
-    q_np = np.random.randn(num)
-    q_np -= q_np.mean()
-
-    # Random dipoles
-    d_np = np.random.randn(num, 3)
-
-    # Random symmetric, traceless quadrupoles per atom
-    t_np = np.empty((num, 3, 3), dtype=float)
-    for i in range(num):
-        A = np.random.randn(3, 3)
-        sym = 0.5 * (A + A.T)
-        trace = np.trace(sym) / 3.0
-        sym -= np.eye(3) * trace  # make traceless
-        t_np[i] = sym
-
-    # Cubic box
-    box_np = np.eye(3) * boxLen
+    """Load test data from npz file and convert to torch tensors."""
+    # Get the directory where the water test data is stored
+    test_dir = os.path.dirname(os.path.abspath(__file__))
+    water_dir = os.path.join(test_dir, "water")
+    npz_path = os.path.join(water_dir, f"random_water_{num}.npz")
+    
+    if not os.path.exists(npz_path):
+        raise FileNotFoundError(f"Test data file not found: {npz_path}")
+    
+    # Load data from npz file
+    data = np.load(npz_path)
+    coords_np = data["coords"]
+    box_np = data["box"]
+    q_np = data["q"]
+    p_np = data["p"]
+    t_np = data["t"]
+    alpha_pme = float(data["alpha"])
+    max_hkl = int(data["max_hkl"])
+    loaded_rank = int(data["rank"])
+    
+    # Use the rank from the file if not specified, otherwise use the requested rank
+    if rank is None:
+        rank = loaded_rank
 
     # Convert to torch tensors with the requested device and dtype
     coords = torch.tensor(coords_np, device=device, dtype=dtype, requires_grad=True)
     box = torch.tensor(box_np, device=device, dtype=dtype)
     q = torch.tensor(q_np, device=device, dtype=dtype, requires_grad=True)
     p = (
-        torch.tensor(d_np, device=device, dtype=dtype, requires_grad=True)
+        torch.tensor(p_np, device=device, dtype=dtype, requires_grad=True)
         if rank >= 1
         else None
     )
@@ -51,21 +51,14 @@ def create_test_data(num: int, rank: int = 2, device: str = "cuda", dtype: torch
         else None
     )
 
-    p = torch.zeros_like(p)
-    t = torch.zeros_like(t)
-
-    # Find appropriate PME parameters.
-    alpha_pme = math.sqrt(-math.log10(2 * 1e-6)) / 9.0
-    max_hkl = 10  # Reasonable default for PME grid
-
     return coords, box, q, p, t, alpha_pme, max_hkl
 
 
 @pytest.mark.parametrize("device, dtype", [("cuda", torch.float64)])
 @pytest.mark.parametrize("rank", [2])
 def test_pme_execution(device, dtype, rank):
-    """Test that PME with use_customized_ops=True can execute successfully."""
-    N = 1000
+    """Compare custom CUDA PME kernel against Python reference implementation."""
+    N = 300
     coords, box, q, p, t, alpha, max_hkl = create_test_data(N, rank, device=device, dtype=dtype)
 
     func = PME(alpha, max_hkl, rank, use_customized_ops=True).to(
@@ -75,24 +68,65 @@ def test_pme_execution(device, dtype, rank):
         device=device, dtype=dtype
     )
 
-    # Test forward pass - should execute without errors
-    result = func(coords, box, q, p, t)
-    result_ref = func_ref(coords, box, q, p, t)
-    print(result[3])
-    print(result_ref[3])
+    # PME returns a tuple; compare energies (index 3) and their gradients.
+    def func_ref_wrapper(coords, box, q, p, t):
+        result = func_ref(coords, box, q, p, t)
+        return result[3] if isinstance(result, tuple) else result
+
+    def func_wrapper(coords, box, q, p, t):
+        result = func(coords, box, q, p, t)
+        return result[3] if isinstance(result, tuple) else result
+
+    check_op(
+        func_wrapper,
+        func_ref_wrapper,
+        {"coords": coords, "box": box, "q": q, "p": p, "t": t},
+        check_grad=True,
+        atol=1e-6 if dtype is torch.float64 else 1e-4,
+        rtol=1e-5,
+    )
+
+
+@pytest.mark.parametrize("device, dtype", [("cuda", torch.float64)])
+@pytest.mark.parametrize("rank", [2])
+def test_perf_pme(device, dtype, rank):
+    """Performance comparison between Python and custom CUDA PME implementations."""
+    N = 300
+    coords, box, q, p, t, alpha, max_hkl = create_test_data(N, rank, device=device, dtype=dtype)
+
+    func_ref = PME(alpha, max_hkl, rank, use_customized_ops=False).to(device=device, dtype=dtype)
+    func = PME(alpha, max_hkl, rank, use_customized_ops=True).to(
+        device=device, dtype=dtype
+    )
+
+    # PME returns a tuple, so we need to extract the energy for backward pass
+    def func_ref_wrapper(*args):
+        result = func_ref(*args)
+        return result[3] if isinstance(result, tuple) else result
     
-    # # Verify that result is a tuple with expected components
-    # assert isinstance(result, tuple), "PME should return a tuple"
-    # assert len(result) == 5, "PME should return 5 components: (phi, E, EG, energy, forces)"
-    
-    # pot, field, EG, energy, forces = result
-    # print(energy)
-    
-    # # Verify all components are tensors (or None for forces)
-    # assert isinstance(pot, torch.Tensor), "pot should be a tensor"
-    # assert isinstance(energy, torch.Tensor), "energy should be a tensor"
-    
-    # if rank >= 1:
-    #     assert isinstance(field, torch.Tensor), "field should be a tensor for rank >= 1"
-    # if rank >= 2:
-    #     assert isinstance(EG, torch.Tensor), "EG should be a tensor for rank >= 2"
+    def func_wrapper(*args):
+        result = func(*args)
+        return result[3] if isinstance(result, tuple) else result
+
+    perf_op(
+        func_ref_wrapper,
+        coords,
+        box,
+        q,
+        p,
+        t,
+        desc=f"pme_ref (N={N}, rank={rank})",
+        repeat=100,
+        run_backward=True,
+    )
+    perf_op(
+        func_wrapper,
+        coords,
+        box,
+        q,
+        p,
+        t,
+        desc=f"pme_torchff (N={N}, rank={rank})",
+        repeat=1000,
+        run_backward=True,
+    )

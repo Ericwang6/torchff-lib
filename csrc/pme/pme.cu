@@ -3,93 +3,14 @@
 #include <cuda_runtime.h>
 #include <math_constants.h>
 #include <vector>
-#include <cufft.h>
 #include <cmath>
 #include <stdio.h> 
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/util/complex.h>
+#include "bsplines.cuh"
 #ifndef PI
 #define PI 3.14159265358979323846
 #endif
-
-// ============================================================================
-// 1. Device Helper: B-Spline Evaluation (Includes 3rd Derivative)
-// ============================================================================
-__device__ __forceinline__ void eval_b6_and_derivs(double u, double* val, double* d1, double* d2, double* d3) {
-    double u2 = u * u;
-    double u3 = u2 * u;
-    double u4 = u3 * u;
-    double u5 = u4 * u;
-
-    if (u < 1.0) {
-        *val = u5 * (1.0/120.0);
-        *d1  = u4 * (1.0/24.0);
-        *d2  = u3 * (1.0/6.0);
-        *d3  = u2 * 0.5;
-    }
-    else if (u < 2.0) {
-        double u_1 = u - 1.0;
-        double u_1_2 = u_1 * u_1;
-        double u_1_3 = u_1_2 * u_1;
-        double u_1_4 = u_1_3 * u_1;
-        double u_1_5 = u_1_4 * u_1;
-
-        *val = u5 * (1.0/120.0) - u_1_5 * (1.0/20.0);
-        *d1  = u4 * (1.0/24.0)  - u_1_4 * 0.25;
-        *d2  = u3 * (1.0/6.0)   - u_1_3;
-        *d3  = u2 * 0.5         - 3.0 * u_1_2;
-    }
-    else if (u < 3.0) {
-        // Range [2, 3)
-        double u_1 = u - 1.0;
-        double u_1_2 = u_1 * u_1;
-        double u_1_4 = u_1_2 * u_1_2;
-        double u_1_5 = u_1_4 * u_1;
-
-        double u_2 = u - 2.0;
-        double u_2_2 = u_2 * u_2;
-        double u_2_4 = u_2_2 * u_2_2;
-        double u_2_5 = u_2_4 * u_2;
-
-        *val = u5 * (1.0/120.0) + u_2_5 * 0.125 - u_1_5 * (1.0/20.0);
-        *d1  = u4 * (1.0/24.0)  + 0.625 * u_2_4 - u_1_4 * 0.25;
-        *d2  = (5.0/3.0)*u3 - 12.0*u2 + 27.0*u - 19.0;
-        *d3  = 5.0*u2 - 24.0*u + 27.0;
-    }
-    else if (u < 4.0) {
-        // Range [3, 4)
-        double u_1 = u - 1.0;
-        double u_1_2 = u_1 * u_1; double u_1_4 = u_1_2 * u_1_2; double u_1_5 = u_1_4 * u_1;
-
-        double u_2 = u - 2.0;
-        double u_2_2 = u_2 * u_2; double u_2_4 = u_2_2 * u_2_2; double u_2_5 = u_2_4 * u_2;
-
-        double u_3 = u - 3.0;
-        double u_3_2 = u_3 * u_3; double u_3_4 = u_3_2 * u_3_2; double u_3_5 = u_3_4 * u_3;
-
-        *val = u5*(1.0/120.0) - u_3_5*(1.0/6.0) + u_2_5*0.125 - u_1_5*(1.0/20.0);
-
-        *d1 = (-5.0/12.0)*u4 + 6.0*u3 - 31.5*u2 + 71.0*u - 57.75;
-        *d2 = (-5.0/3.0)*u3 + 18.0*u2 - 63.0*u + 71.0;
-        *d3 = -5.0*u2 + 36.0*u - 63.0;
-    }
-    else if (u < 5.0) {
-        // Range [4, 5)
-        *val = u5*(1.0/24.0) - u4 + 9.5*u3 - 44.5*u2 + 102.25*u - 91.45;
-        *d1  = (5.0/24.0)*u4 - 4.0*u3 + 28.5*u2 - 89.0*u + 102.25;
-        *d2  = (5.0/6.0)*u3 - 12.0*u2 + 57.0*u - 89.0;
-        *d3  = 2.5*u2 - 24.0*u + 57.0;
-    }
-    else if (u < 6.0) {
-        // Range [5, 6) 
-        *val = -u5*(1.0/120.0) + 0.25*u4 - 3.0*u3 + 18.0*u2 - 54.0*u + 64.8;
-        *d1  = -u4*(1.0/24.0) + u3 - 9.0*u2 + 36.0*u - 54.0;
-        *d2  = -u3*(1.0/6.0) + 3.0*u2 - 18.0*u + 36.0;
-        *d3  = -0.5*u2 + 6.0*u - 18.0;
-    }
-    else {
-        *val = 0.0; *d1 = 0.0; *d2 = 0.0; *d3 = 0.0;
-    }
-}
 
 // ============================================================================
 // 2. Spread Kernel
@@ -127,14 +48,14 @@ __global__ void spread_q_kernel(
         u_frac[i] = ( (double)m_u0[i] - val) + 3.0;
     }
 
-    double M[3][6], dM[3][6], d2M[3][6], d3M[3][6];
+    double M[3][6], dM[3][6], d2M[3][6];
     //Calculate B-Spline and derivatives
     #pragma unroll
     for(int d=0; d<3; d++) {
         #pragma unroll
         for(int k=0; k<6; k++) {
             double u_eval = u_frac[d] + (double)(k - 3);
-            eval_b6_and_derivs(u_eval, &M[d][k], &dM[d][k], &d2M[d][k], &d3M[d][k]);
+            eval_b6_and_derivs<double>(u_eval, &M[d][k], &dM[d][k], &d2M[d][k]);
         }
     }
     //Initialize monopoles
@@ -305,7 +226,7 @@ __global__ void interpolate_kernel(
         #pragma unroll
         for(int k=0; k<6; k++) {
             double u_eval = u_frac[d] + (double)(k - 3);
-            eval_b6_and_derivs(u_eval, &M[d][k], &dM[d][k], &d2M[d][k], &d3M[d][k]);
+            eval_b6_and_derivs<double>(u_eval, &M[d][k], &dM[d][k], &d2M[d][k], &d3M[d][k]);
         }
     }
 
@@ -534,7 +455,9 @@ __device__ __forceinline__ double get_bspline_modulus_device(int k, int K, int o
 }
 
 __global__ void pme_convolution_fused_kernel(
-    cufftDoubleComplex* __restrict__ d_grid,
+    // double* __restrict__ d_grid_real,
+    // double* __restrict__ d_grid_imag,
+    c10::complex<double>* __restrict__ grid_recip,
     const double* __restrict__ d_recip,
     int K1, int K2, int K3,
     double alpha,
@@ -548,7 +471,8 @@ __global__ void pme_convolution_fused_kernel(
     int flat_idx = idx_x * K2 * K3_complex + idx_y * K3_complex + idx_z;
 
     if (idx_x == 0 && idx_y == 0 && idx_z == 0) {
-        d_grid[flat_idx].x = 0.0; d_grid[flat_idx].y = 0.0; return;
+        // d_grid_real[flat_idx] = 0.0; d_grid_imag[flat_idx] = 0.0; return;
+        grid_recip[flat_idx] = c10::complex<double>(0.0, 0.0); return;
     }
     double mx = (idx_x <= K1/2) ? (double)idx_x : (double)(idx_x - K1);
     double my = (idx_y <= K2/2) ? (double)idx_y : (double)(idx_y - K2);
@@ -565,78 +489,58 @@ __global__ void pme_convolution_fused_kernel(
     double theta_sq = theta * theta;
     double scale_factor = (1.0 / theta_sq);
     double factor = C_k * scale_factor;
-    d_grid[flat_idx].x *= factor;
-    d_grid[flat_idx].y *= factor;
+    // d_grid_real[flat_idx] *= factor;
+    // d_grid_imag[flat_idx] *= factor;
+    grid_recip[flat_idx] *= factor;
 }
 
 // ============================================================================
 // 5. Host Pipeline
 // ============================================================================
+template <int RANK>
 void compute_pme_cuda_pipeline(
     torch::Tensor coords, torch::Tensor Q, torch::Tensor recip_vecs,
-    torch::Tensor grid_tensor, torch::Tensor phi_atoms,
+    torch::Tensor phi_atoms,
     torch::Tensor E_atoms, torch::Tensor EG_atoms,
     torch::Tensor force_atoms,
-    double alpha, double volume, int K1, int K2, int K3, int rank
+    double alpha, double volume, int K1, int K2, int K3
 ) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     double* d_coords = coords.data_ptr<double>();
     double* d_Q      = Q.data_ptr<double>();
     double* d_recip  = recip_vecs.data_ptr<double>();
-    double* d_grid_real = grid_tensor.data_ptr<double>();
-    double* d_phi = phi_atoms.data_ptr<double>();
-    double* d_E   = E_atoms.data_ptr<double>();
-    double* d_EG  = EG_atoms.data_ptr<double>();
+    double* d_phi   = phi_atoms.data_ptr<double>();
+    double* d_E     = E_atoms.data_ptr<double>();
+    double* d_EG    = EG_atoms.data_ptr<double>();
     double* d_force = force_atoms.data_ptr<double>();
 
     int N_atoms = coords.size(0);
-    int total_points = K1*K2*K3;
     int K3_complex = K3 / 2 + 1;
 
-    auto grid_complex_tensor = torch::empty({K1 * K2 * K3_complex * 2},
-        torch::TensorOptions().dtype(torch::kDouble).device(coords.device()));
-    cufftDoubleComplex* d_grid_complex = (cufftDoubleComplex*)grid_complex_tensor.data_ptr<double>();
-
-    cufftHandle plan_fwd, plan_bwd;
-    cufftPlan3d(&plan_fwd, K1, K2, K3, CUFFT_D2Z);
-    cufftPlan3d(&plan_bwd, K1, K2, K3, CUFFT_Z2D);
-    cufftSetStream(plan_fwd, stream);
-    cufftSetStream(plan_bwd, stream);
-
-    // 1. Spread
-    cudaMemsetAsync(d_grid_real, 0, sizeof(double)*total_points, stream);
+    // 1. Allocate 3D grid (contiguous) and spread charges
+    auto grid_3d = torch::zeros({K1, K2, K3}, coords.options());
+    double* d_grid_real = grid_3d.data_ptr<double>();
     int threads = 256;
     int blocks = (N_atoms + threads - 1) / threads;
     
-    if (rank == 0) {
-        spread_q_kernel<0><<<blocks, threads, 0, stream>>>(d_coords, d_Q, d_recip, d_grid_real, N_atoms, K1, K2, K3);
-    } else if (rank == 1) {
-        spread_q_kernel<1><<<blocks, threads, 0, stream>>>(d_coords, d_Q, d_recip, d_grid_real, N_atoms, K1, K2, K3);
-    } else {
-        spread_q_kernel<2><<<blocks, threads, 0, stream>>>(d_coords, d_Q, d_recip, d_grid_real, N_atoms, K1, K2, K3);
-    }
+    spread_q_kernel<RANK><<<blocks, threads, 0, stream>>>(d_coords, d_Q, d_recip, d_grid_real, N_atoms, K1, K2, K3);
 
-    // 2. FFTs
-    cufftExecD2Z(plan_fwd, (cufftDoubleReal*)d_grid_real, d_grid_complex);
+    // 2. Forward FFT (real to complex)
+    auto grid_recip = torch::fft::rfftn(grid_3d).contiguous();
+    c10::complex<double>* grid_recip_ptr = grid_recip.data_ptr<c10::complex<double>>();
+    
     dim3 dimBlock(8, 8, 8);
     dim3 dimGrid((K1+7)/8, (K2+7)/8, (K3_complex+7)/8);
-    pme_convolution_fused_kernel<<<dimGrid, dimBlock, 0, stream>>>(
-        d_grid_complex, d_recip, K1, K2, K3, alpha, volume);
-    cufftExecZ2D(plan_bwd, d_grid_complex, (cufftDoubleReal*)d_grid_real);
+    pme_convolution_fused_kernel<<<dimGrid, dimBlock, 0, stream>>>(grid_recip_ptr, d_recip, K1, K2, K3, alpha, volume);
 
-    // 3. Interpolate (AND FORCES)
-    if (rank == 0) {
-        interpolate_kernel<0><<<blocks, threads, 0, stream>>>(d_grid_real, d_coords, d_recip, d_Q, d_phi, d_E, d_EG, d_force, alpha, N_atoms, K1, K2, K3);
-    } else if (rank == 1) {
-        interpolate_kernel<1><<<blocks, threads, 0, stream>>>(d_grid_real, d_coords, d_recip, d_Q, d_phi, d_E, d_EG, d_force, alpha, N_atoms, K1, K2, K3);
-    } else {
-        interpolate_kernel<2><<<blocks, threads, 0, stream>>>(d_grid_real, d_coords, d_recip, d_Q, d_phi, d_E, d_EG, d_force, alpha, N_atoms, K1, K2, K3);
-    }
+    // 3. Inverse FFT (complex to real)
+    auto grid_real = torch::fft::irfftn(grid_recip, {K1, K2, K3}, c10::nullopt, "forward");
+    double* grid_real_ptr = grid_real.data_ptr<double>();
 
-    cudaDeviceSynchronize();
-    cufftDestroy(plan_fwd);
-    cufftDestroy(plan_bwd);
+    // 4. Interpolate (AND FORCES)
+    interpolate_kernel<RANK><<<blocks, threads, 0, stream>>>(grid_real_ptr, d_coords, d_recip, d_Q, d_phi, d_E, d_EG, d_force, alpha, N_atoms, K1, K2, K3);
+
 }
 
 // ============================================================================
@@ -706,14 +610,18 @@ struct PMELongRangeFunction : public torch::autograd::Function<PMELongRangeFunct
     at::Tensor E   = torch::zeros({N, 3}, options);
     at::Tensor EG  = torch::zeros({N, 6}, options); // Flat (xx, xy, xz, yy, yz, zz)
     at::Tensor forces = torch::zeros({N, 3}, options);
-    at::Tensor grid_scratch = torch::zeros({K1, K2, K3}, options);
 
-    // --- 4. Run CUDA Pipeline ---
-    compute_pme_cuda_pipeline(
-        coords, Q_combined, recip_vecs, grid_scratch,
-        phi, E, EG, forces,
-        alpha, volume, K1, K2, K3, rank
-    );
+    // --- 4. Run CUDA Pipeline (allocates its own grid internally) ---
+    if ( rank == 0 ) {
+        compute_pme_cuda_pipeline<0>(coords, Q_combined, recip_vecs, phi, E, EG, forces, alpha, volume, K1, K2, K3);
+    }
+    else if ( rank == 1 ) {
+        compute_pme_cuda_pipeline<1>(coords, Q_combined, recip_vecs, phi, E, EG, forces, alpha, volume, K1, K2, K3);
+    }
+    else {
+        compute_pme_cuda_pipeline<2>(coords, Q_combined, recip_vecs, phi, E, EG, forces, alpha, volume, K1, K2, K3);
+    }
+    
 
     // --- 5. Apply Self-Corrections ---
     double pi = CUDART_PI;
