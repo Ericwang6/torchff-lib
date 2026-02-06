@@ -199,8 +199,8 @@ def spread_Q(N, positions, box, Q_dict, n_mesh, rank):
         Theta_real[:, 1, 1] = t_vec[:, 3] # yy
         Theta_real[:, 2, 2] = t_vec[:, 5] # zz
         trace_check = Theta_real[:,0,0] + Theta_real[:,1,1] + Theta_real[:,2,2]
-        print(f"Mean Trace: {trace_check.mean().item()}")
-        print(f"Max Trace:  {trace_check.abs().max().item()}")
+        # print(f"Mean Trace: {trace_check.mean().item()}")
+        # print(f"Max Trace:  {trace_check.abs().max().item()}")
 
         # Fill off-diagonal (Symmetric)
         Theta_real[:, 0, 1] = t_vec[:, 1]; Theta_real[:, 1, 0] = t_vec[:, 1] # xy
