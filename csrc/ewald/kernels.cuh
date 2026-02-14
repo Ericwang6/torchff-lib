@@ -601,7 +601,7 @@ __global__ void ewald_backward_kernel(
     const T ri_z = coords[i*3+2];
     T fx = 0, fy = 0, fz = 0;
 
-    MultipoleAccum<T, RANK> mp{};
+    MultipoleAccumWithGrad<T, RANK> mp{};
     mp.c0 = q[i];
     if constexpr (RANK >= 1) { 
         mp.dx = p[3*i+0]; mp.dy = p[3*i+1]; mp.dz = p[3*i+2]; 
@@ -666,9 +666,6 @@ __global__ void ewald_backward_kernel(
         );
     }
 }
-
-
-
 
 
 template <typename T, int64_t RANK = 0, int64_t BLOCK_SIZE = 256>
@@ -801,7 +798,7 @@ __global__ void ewald_backward_with_fields_kernel(
     const T ry = coords[i*3+1];
     const T rz = coords[i*3+2];
 
-    MultipoleAccum<T, RANK> mp{};
+    MultipoleAccumWithGrad<T, RANK> mp{};
     mp.c0 = q[i];
     if constexpr (RANK >= 1) {
         mp.dx = p[i*3+0]; mp.dy = p[i*3+1]; mp.dz = p[i*3+2];
