@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from typing import Optional
 from .pme_ref import compute_pme
+from . import bsplines
 try:
     import torchff
     import torchff_pme
@@ -15,6 +16,14 @@ class PME(nn.Module):
         self.max_hkl = int(max_hkl)
         self.rank = int(rank)
         self.use_customized_ops = use_customized_ops
+        if use_customized_ops:
+            K = self.max_hkl
+            xmoduli = bsplines.compute_bspline_moduli_1d(K, dtype=torch.float32)
+            ymoduli = bsplines.compute_bspline_moduli_1d(K, dtype=torch.float32)
+            zmoduli = bsplines.compute_bspline_moduli_z(K, dtype=torch.float32)
+            self.register_buffer("xmoduli", xmoduli)
+            self.register_buffer("ymoduli", ymoduli)
+            self.register_buffer("zmoduli", zmoduli)
 
     def _pack_quadrupoles(self, t: torch.Tensor) -> torch.Tensor:
         """
@@ -66,7 +75,8 @@ class PME(nn.Module):
         # PyTorch will automatically map those gradients back to the original (N, 3, 3) t input.
         return torch.ops.torchff.pme_long_range(
             coords, box, q, p, t_packed,
-            self.max_hkl, self.rank, self.alpha
+            self.max_hkl, self.rank, self.alpha,
+            self.xmoduli, self.ymoduli, self.zmoduli
         )
 
     def _forward_python(self, coords, box, q, p, t_packed):

@@ -434,6 +434,9 @@ template <typename T>
 __global__ void pme_convolution_fused_kernel(
     c10::complex<T>* __restrict__ grid_recip,
     const T* __restrict__ d_recip,
+    const T* __restrict__ xmoduli,
+    const T* __restrict__ ymoduli,
+    const T* __restrict__ zmoduli,
     int K1, int K2, int K3,
     T alpha,
     T V
@@ -457,9 +460,9 @@ __global__ void pme_convolution_fused_kernel(
     T kz = TWOPI * (mx * d_recip[2] + my * d_recip[5] + mz * d_recip[8]);
     T ksq = kx*kx + ky*ky + kz*kz;
     T C_k = ((T)2.0 * TWOPI / (V * ksq)) * exp(-ksq / ((T)4.0 * alpha * alpha));
-    T theta_x = get_bspline_modulus_device<T>(idx_x, K1, 6);
-    T theta_y = get_bspline_modulus_device<T>(idx_y, K2, 6);
-    T theta_z = get_bspline_modulus_device<T>(idx_z, K3, 6);
+    T theta_x = xmoduli[idx_x];
+    T theta_y = ymoduli[idx_y];
+    T theta_z = zmoduli[idx_z];
     T theta = theta_x * theta_y * theta_z;
     T theta_sq = theta * theta;
     T scale_factor = ((T)1.0 / theta_sq);
@@ -472,10 +475,11 @@ __global__ void pme_convolution_fused_kernel(
 // ============================================================================
 template <typename T, int RANK>
 void compute_pme_cuda_pipeline(
-    torch::Tensor coords, torch::Tensor Q, torch::Tensor recip_vecs,
-    torch::Tensor phi_atoms,
-    torch::Tensor E_atoms, torch::Tensor EG_atoms,
-    torch::Tensor force_atoms,
+    const at::Tensor& coords, const at::Tensor& Q, const at::Tensor& recip_vecs,
+    const at::Tensor& xmoduli, const at::Tensor& ymoduli, const at::Tensor& zmoduli,
+    const at::Tensor& phi_atoms,
+    const at::Tensor& E_atoms, const at::Tensor& EG_atoms,
+    const at::Tensor& force_atoms,
     T alpha, T volume, int K1, int K2, int K3
 ) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -483,6 +487,9 @@ void compute_pme_cuda_pipeline(
     T* d_coords = coords.data_ptr<T>();
     T* d_Q      = Q.data_ptr<T>();
     T* d_recip  = recip_vecs.data_ptr<T>();
+    T* d_xmoduli = xmoduli.data_ptr<T>();
+    T* d_ymoduli = ymoduli.data_ptr<T>();
+    T* d_zmoduli = zmoduli.data_ptr<T>();
     T* d_phi   = phi_atoms.data_ptr<T>();
     T* d_E     = E_atoms.data_ptr<T>();
     T* d_EG    = EG_atoms.data_ptr<T>();
@@ -505,7 +512,7 @@ void compute_pme_cuda_pipeline(
 
     dim3 dimBlock(8, 8, 8);
     dim3 dimGrid((K1+7)/8, (K2+7)/8, (K3_complex+7)/8);
-    pme_convolution_fused_kernel<T><<<dimGrid, dimBlock, 0, stream>>>(grid_recip_ptr, d_recip, K1, K2, K3, alpha, volume);
+    pme_convolution_fused_kernel<T><<<dimGrid, dimBlock, 0, stream>>>(grid_recip_ptr, d_recip, d_xmoduli, d_ymoduli, d_zmoduli, K1, K2, K3, alpha, volume);
 
     // 3. Inverse FFT (complex to real)
     auto grid_real = torch::fft::irfftn(grid_recip, {K1, K2, K3}, c10::nullopt, "forward");
@@ -550,22 +557,17 @@ public:
 
 static torch::autograd::variable_list forward(
     torch::autograd::AutogradContext* ctx,
-    at::Tensor coords, at::Tensor box, at::Tensor q, at::Tensor p, at::Tensor t,
-    at::Tensor K_t, at::Tensor rank_t, at::Tensor alpha_t
+    const at::Tensor& coords, const at::Tensor& box, const at::Tensor& q, const at::Tensor& p, const at::Tensor& t,
+    at::Scalar K_t, at::Scalar rank_t, at::Scalar alpha_t,
+    const at::Tensor& xmoduli, const at::Tensor& ymoduli, const at::Tensor& zmoduli
 ) {
-    TORCH_CHECK(at::isFloatingType(coords.scalar_type()), "Coords must be float or double");
-    TORCH_CHECK(q.scalar_type() == coords.scalar_type(), "Charges must match coords dtype");
 
-    int rank = rank_t.item<int64_t>();
+
+    const int64_t rank = rank_t.toLong();
+    const int64_t K = K_t.toLong();
+    const int K1 = K, K2 = K, K3 = K;
 
     // --- 1. Setup Grid & Geometry ---
-    int K1, K2, K3;
-    if (K_t.numel() == 1) {
-        K1 = K2 = K3 = K_t.item<int64_t>();
-    } else {
-        auto k_acc = K_t.accessor<int64_t, 1>();
-        K1 = k_acc[0]; K2 = k_acc[1]; K3 = k_acc[2];
-    }
     at::Tensor recip_vecs = torch::inverse(box).t().contiguous().to(coords.dtype());
     int N = coords.size(0);
 
@@ -587,14 +589,14 @@ static torch::autograd::variable_list forward(
 
     // --- 4. Run CUDA Pipeline (allocates its own grid internally) ---
     AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "pme_long_range_forward", ([&] {
-        scalar_t alpha_val = static_cast<scalar_t>(alpha_t.item<double>());
+        scalar_t alpha_val = static_cast<scalar_t>(alpha_t.toDouble());
         scalar_t volume_val = static_cast<scalar_t>(torch::det(box).item<double>());
         if (rank == 0) {
-            compute_pme_cuda_pipeline<scalar_t, 0>(coords, Q_combined, recip_vecs, phi, E, EG, forces, alpha_val, volume_val, K1, K2, K3);
+            compute_pme_cuda_pipeline<scalar_t, 0>(coords, Q_combined, recip_vecs, xmoduli, ymoduli, zmoduli, phi, E, EG, forces, alpha_val, volume_val, K1, K2, K3);
         } else if (rank == 1) {
-            compute_pme_cuda_pipeline<scalar_t, 1>(coords, Q_combined, recip_vecs, phi, E, EG, forces, alpha_val, volume_val, K1, K2, K3);
+            compute_pme_cuda_pipeline<scalar_t, 1>(coords, Q_combined, recip_vecs, xmoduli, ymoduli, zmoduli, phi, E, EG, forces, alpha_val, volume_val, K1, K2, K3);
         } else {
-            compute_pme_cuda_pipeline<scalar_t, 2>(coords, Q_combined, recip_vecs, phi, E, EG, forces, alpha_val, volume_val, K1, K2, K3);
+            compute_pme_cuda_pipeline<scalar_t, 2>(coords, Q_combined, recip_vecs, xmoduli, ymoduli, zmoduli, phi, E, EG, forces, alpha_val, volume_val, K1, K2, K3);
         }
 
         // --- 5. Apply Self-Corrections ---
@@ -645,8 +647,9 @@ static torch::autograd::variable_list forward(
     }
 
     // --- 8. Save Variables for Backward ---
-    // We save: Forces, Field(E), Field Gradient(EG_3x3), Rank, Alpha
-    ctx->save_for_backward({forces, E, EG_reshaped, rank_t, alpha_t, p, t});
+    ctx->saved_data["rank"] = static_cast<int64_t>(rank);
+    ctx->saved_data["alpha"] = alpha_t;
+    ctx->save_for_backward({forces, E, EG_reshaped, p, t});
 
     return {phi, E, EG_reshaped, energy, forces};
 }
@@ -663,12 +666,10 @@ static torch::autograd::variable_list backward(torch::autograd::AutogradContext*
     const at::Tensor& forces_internal = saved[0]; // (N,3) Calculated Forces (-dE/dx)
     const at::Tensor& field           = saved[1]; // (N,3) Electric Field
     const at::Tensor& field_grad      = saved[2]; // (N,3,3) Hessian
-    const at::Tensor& rank_t          = saved[3];
-    const at::Tensor& alpha_t         = saved[4];
-    const at::Tensor& p               = saved[5];
-    const at::Tensor& t               = saved[6];
+    const at::Tensor& p               = saved[3];
+    const at::Tensor& t               = saved[4];
 
-    int64_t rank = rank_t.item<int64_t>();
+    int64_t rank = ctx->saved_data["rank"].toInt();
 
     // --- A. Compute d_coords (Forces on Atoms) ---
     at::Tensor dcoords = torch::zeros_like(forces_internal);
@@ -685,7 +686,7 @@ static torch::autograd::variable_list backward(torch::autograd::AutogradContext*
     at::Tensor d_p;
     at::Tensor d_t;
     AT_DISPATCH_FLOATING_TYPES(forces_internal.scalar_type(), "pme_long_range_backward", ([&] {
-        scalar_t alpha_val = static_cast<scalar_t>(alpha_t.item<double>());
+        scalar_t alpha_val = static_cast<scalar_t>(ctx->saved_data["alpha"].toDouble());
         constexpr scalar_t INV_ROOT_PI = inv_root_pi<scalar_t>();
         scalar_t alpha_over_root_pi = alpha_val * INV_ROOT_PI;
         scalar_t alpha2 = alpha_val * alpha_val;
@@ -733,7 +734,10 @@ static torch::autograd::variable_list backward(torch::autograd::AutogradContext*
         d_t,            // t (Quadrupoles)
         at::Tensor(),   // K
         at::Tensor(),   // rank
-        at::Tensor()    // alpha
+        at::Tensor(),   // alpha
+        at::Tensor(),   // xmoduli
+        at::Tensor(),   // ymoduli
+        at::Tensor()    // zmoduli
     };
 }
 
@@ -742,11 +746,8 @@ static torch::autograd::variable_list backward(torch::autograd::AutogradContext*
 
 TORCH_LIBRARY_IMPL(torchff, AutogradCUDA, m) {
     m.impl("pme_long_range",
-        [](const at::Tensor& coords, const at::Tensor& box, const at::Tensor& q, const at::Tensor& p, const at::Tensor& t, int64_t K, int64_t rank, double alpha) {
-            auto K_t     = at::scalar_tensor(K,     at::TensorOptions().dtype(at::kLong).device(coords.device()));
-            auto rank_t  = at::scalar_tensor(rank,  at::TensorOptions().dtype(at::kLong).device(coords.device()));
-            auto alpha_t = at::scalar_tensor(alpha, at::TensorOptions().dtype(at::kDouble).device(coords.device()));
-            auto outs = PMELongRangeFunction::apply(coords, box, q, p, t, K_t, rank_t, alpha_t);
+        [](const at::Tensor& coords, const at::Tensor& box, const at::Tensor& q, const at::Tensor& p, const at::Tensor& t, at::Scalar K, at::Scalar rank, at::Scalar alpha, const at::Tensor& xmoduli, const at::Tensor& ymoduli, const at::Tensor& zmoduli) {
+            auto outs = PMELongRangeFunction::apply(coords, box, q, p, t, K, rank, alpha, xmoduli, ymoduli, zmoduli);
             return std::make_tuple(outs[0], outs[1], outs[2], outs[3], outs[4]);
         });
 }

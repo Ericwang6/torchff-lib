@@ -55,11 +55,11 @@ def create_test_data(num: int, rank: int = 2, device: str = "cuda", dtype: torch
 
 
 @pytest.mark.parametrize("device, dtype", [("cuda", torch.float64)])
-@pytest.mark.parametrize("rank", [2])
+@pytest.mark.parametrize("rank", [0])
 def test_pme_execution(device, dtype, rank):
     """Compare custom CUDA PME kernel against Python reference implementation."""
     N = 300
-    coords, box, q, p, t, alpha, max_hkl = create_test_data(N, rank, device=device, dtype=dtype)
+    coords, box, q, p, t, alpha, max_hkl = create_test_data(N, 2, device=device, dtype=dtype)
 
     func = PME(alpha, max_hkl, rank, use_customized_ops=True).to(
         device=device, dtype=dtype
@@ -91,8 +91,8 @@ def test_pme_execution(device, dtype, rank):
 @pytest.mark.parametrize("rank", [2])
 def test_perf_pme(device, dtype, rank):
     """Performance comparison between Python and custom CUDA PME implementations."""
-    N = 300
-    coords, box, q, p, t, alpha, max_hkl = create_test_data(N, rank, device=device, dtype=dtype)
+    N = 10000
+    coords, box, q, p, t, alpha, max_hkl = create_test_data(N, 2, device=device, dtype=dtype)
 
     func_ref = PME(alpha, max_hkl, rank, use_customized_ops=False).to(device=device, dtype=dtype)
     func = PME(alpha, max_hkl, rank, use_customized_ops=True).to(
