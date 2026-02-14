@@ -8,9 +8,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/util/complex.h>
 #include "bsplines.cuh"
-#ifndef PI
-#define PI 3.14159265358979323846
-#endif
+#include "common/constants.cuh"
 
 // ============================================================================
 // 2. Spread Kernel
@@ -444,19 +442,18 @@ __device__ __forceinline__ double get_bspline_coeff_order6(int i) {
     }
 }
 __device__ __forceinline__ double get_bspline_modulus_device(int k, int K, int order) {
+    constexpr double TWOPI = two_pi<double>();
     double sum_val = 0.0;
     int half = order / 2; 
     for (int m = -half; m < half; m++) {
         double b_val = (order == 6) ? get_bspline_coeff_order6(m + half) : 0.0;
-        double arg = (2.0 * PI * (double)m * (double)k) / (double)K;
+        double arg = (TWOPI * (double)m * (double)k) / (double)K;
         sum_val += b_val * cos(arg);
     }
     return sum_val;
 }
 
 __global__ void pme_convolution_fused_kernel(
-    // double* __restrict__ d_grid_real,
-    // double* __restrict__ d_grid_imag,
     c10::complex<double>* __restrict__ grid_recip,
     const double* __restrict__ d_recip,
     int K1, int K2, int K3,
@@ -474,14 +471,15 @@ __global__ void pme_convolution_fused_kernel(
         // d_grid_real[flat_idx] = 0.0; d_grid_imag[flat_idx] = 0.0; return;
         grid_recip[flat_idx] = c10::complex<double>(0.0, 0.0); return;
     }
+    constexpr double TWOPI = two_pi<double>();
     double mx = (idx_x <= K1/2) ? (double)idx_x : (double)(idx_x - K1);
     double my = (idx_y <= K2/2) ? (double)idx_y : (double)(idx_y - K2);
     double mz = (double)idx_z; 
-    double kx = 2.0 * PI * (mx * d_recip[0] + my * d_recip[3] + mz * d_recip[6]);
-    double ky = 2.0 * PI * (mx * d_recip[1] + my * d_recip[4] + mz * d_recip[7]);
-    double kz = 2.0 * PI * (mx * d_recip[2] + my * d_recip[5] + mz * d_recip[8]);
+    double kx = TWOPI * (mx * d_recip[0] + my * d_recip[3] + mz * d_recip[6]);
+    double ky = TWOPI * (mx * d_recip[1] + my * d_recip[4] + mz * d_recip[7]);
+    double kz = TWOPI * (mx * d_recip[2] + my * d_recip[5] + mz * d_recip[8]);
     double ksq = kx*kx + ky*ky + kz*kz;
-    double C_k = (4.0 * PI / (V * ksq)) * exp(-ksq / (4.0 * alpha * alpha));
+    double C_k = (2.0 * TWOPI / (V * ksq)) * exp(-ksq / (4.0 * alpha * alpha));
     double theta_x = get_bspline_modulus_device(idx_x, K1, 6);
     double theta_y = get_bspline_modulus_device(idx_y, K2, 6);
     double theta_z = get_bspline_modulus_device(idx_z, K3, 6);
@@ -489,8 +487,6 @@ __global__ void pme_convolution_fused_kernel(
     double theta_sq = theta * theta;
     double scale_factor = (1.0 / theta_sq);
     double factor = C_k * scale_factor;
-    // d_grid_real[flat_idx] *= factor;
-    // d_grid_imag[flat_idx] *= factor;
     grid_recip[flat_idx] *= factor;
 }
 
@@ -521,10 +517,10 @@ void compute_pme_cuda_pipeline(
     // 1. Allocate 3D grid (contiguous) and spread charges
     auto grid_3d = torch::zeros({K1, K2, K3}, coords.options());
     double* d_grid_real = grid_3d.data_ptr<double>();
-    int threads = 256;
-    int blocks = (N_atoms + threads - 1) / threads;
+    constexpr int BLOCK_SIZE = 256;
+    int GRID_SIZE = (N_atoms + BLOCK_SIZE - 1) / BLOCK_SIZE;
     
-    spread_q_kernel<RANK><<<blocks, threads, 0, stream>>>(d_coords, d_Q, d_recip, d_grid_real, N_atoms, K1, K2, K3);
+    spread_q_kernel<RANK><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(d_coords, d_Q, d_recip, d_grid_real, N_atoms, K1, K2, K3);
 
     // 2. Forward FFT (real to complex)
     auto grid_recip = torch::fft::rfftn(grid_3d).contiguous();
@@ -539,7 +535,7 @@ void compute_pme_cuda_pipeline(
     double* grid_real_ptr = grid_real.data_ptr<double>();
 
     // 4. Interpolate (AND FORCES)
-    interpolate_kernel<RANK><<<blocks, threads, 0, stream>>>(grid_real_ptr, d_coords, d_recip, d_Q, d_phi, d_E, d_EG, d_force, alpha, N_atoms, K1, K2, K3);
+    interpolate_kernel<RANK><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(grid_real_ptr, d_coords, d_recip, d_Q, d_phi, d_E, d_EG, d_force, alpha, N_atoms, K1, K2, K3);
 
 }
 
@@ -624,8 +620,8 @@ struct PMELongRangeFunction : public torch::autograd::Function<PMELongRangeFunct
     
 
     // --- 5. Apply Self-Corrections ---
-    double pi = CUDART_PI;
-    double alpha_over_root_pi = alpha / sqrt(pi);
+    constexpr double INV_ROOT_PI = inv_root_pi<double>();
+    double alpha_over_root_pi = alpha * INV_ROOT_PI;
     double alpha2 = alpha * alpha;
 
     phi.sub_(q * (2.0 * alpha_over_root_pi));
@@ -695,8 +691,8 @@ struct PMELongRangeFunction : public torch::autograd::Function<PMELongRangeFunct
 
     int64_t rank = rank_t.item<int64_t>();
     double alpha = alpha_t.item<double>();
-    double pi = 3.14159265358979323846;
-    double alpha_over_root_pi = alpha / sqrt(pi);
+    constexpr double INV_ROOT_PI = inv_root_pi<double>();
+    double alpha_over_root_pi = alpha * INV_ROOT_PI;
     double alpha2 = alpha * alpha;
 
     // --- A. Compute d_coords (Forces on Atoms) ---
