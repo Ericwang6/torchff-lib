@@ -1,6 +1,8 @@
 #ifndef BSPLINES_CUH
 #define BSPLINES_CUH
 
+#include "common/constants.cuh"
+
 // ============================================================================
 // B-Spline Evaluation (Includes optional 3rd Derivative)
 // ============================================================================

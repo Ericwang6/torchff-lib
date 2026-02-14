@@ -22,15 +22,16 @@ __global__ void spread_q_kernel(
     int N_atoms,
     int K1, int K2, int K3
 ) {
+    __shared__ T n_star[3][3];
+    if (threadIdx.x < 9) {
+        int i = threadIdx.x / 3;
+        int j = threadIdx.x % 3;
+        n_star[i][j] = recip_vecs[i * 3 + j];
+    }
+    __syncthreads();
+
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N_atoms) return;
-
-    T n_star[3][3];
-    #pragma unroll
-    for(int i=0; i<3; i++)
-        #pragma unroll
-        for(int j=0; j<3; j++)
-            n_star[i][j] = recip_vecs[i*3 + j];
 
     T r[3];
     r[0] = coords[idx * 3 + 0]; r[1] = coords[idx * 3 + 1]; r[2] = coords[idx * 3 + 2];
@@ -192,17 +193,18 @@ __global__ void interpolate_kernel(
     int N_atoms,
     int K1, int K2, int K3
 ) {
+    __shared__ T n_star[3][3];
+    if (threadIdx.x < 9) {
+        int i = threadIdx.x / 3;
+        int j = threadIdx.x % 3;
+        n_star[i][j] = recip_vecs[i * 3 + j];
+    }
+    __syncthreads();
+
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N_atoms) return;
 
     // --- 1. Geometry Setup ---
-    T n_star[3][3];
-    #pragma unroll
-    for(int i=0; i<3; i++)
-        #pragma unroll
-        for(int j=0; j<3; j++)
-            n_star[i][j] = recip_vecs[i*3 + j];
-
     T r[3] = {coords[idx*3+0], coords[idx*3+1], coords[idx*3+2]};
     T grid_K[3] = {(T)K1, (T)K2, (T)K3};
 
@@ -468,49 +470,49 @@ __global__ void pme_convolution_fused_kernel(
 // ============================================================================
 // 5. Host Pipeline
 // ============================================================================
-template <int RANK>
+template <typename T, int RANK>
 void compute_pme_cuda_pipeline(
     torch::Tensor coords, torch::Tensor Q, torch::Tensor recip_vecs,
     torch::Tensor phi_atoms,
     torch::Tensor E_atoms, torch::Tensor EG_atoms,
     torch::Tensor force_atoms,
-    double alpha, double volume, int K1, int K2, int K3
+    T alpha, T volume, int K1, int K2, int K3
 ) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    double* d_coords = coords.data_ptr<double>();
-    double* d_Q      = Q.data_ptr<double>();
-    double* d_recip  = recip_vecs.data_ptr<double>();
-    double* d_phi   = phi_atoms.data_ptr<double>();
-    double* d_E     = E_atoms.data_ptr<double>();
-    double* d_EG    = EG_atoms.data_ptr<double>();
-    double* d_force = force_atoms.data_ptr<double>();
+    T* d_coords = coords.data_ptr<T>();
+    T* d_Q      = Q.data_ptr<T>();
+    T* d_recip  = recip_vecs.data_ptr<T>();
+    T* d_phi   = phi_atoms.data_ptr<T>();
+    T* d_E     = E_atoms.data_ptr<T>();
+    T* d_EG    = EG_atoms.data_ptr<T>();
+    T* d_force = force_atoms.data_ptr<T>();
 
     int N_atoms = coords.size(0);
     int K3_complex = K3 / 2 + 1;
 
     // 1. Allocate 3D grid (contiguous) and spread charges
     auto grid_3d = torch::zeros({K1, K2, K3}, coords.options());
-    double* d_grid_real = grid_3d.data_ptr<double>();
+    T* d_grid_real = grid_3d.data_ptr<T>();
     constexpr int BLOCK_SIZE = 256;
     int GRID_SIZE = (N_atoms + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    
-    spread_q_kernel<double, RANK><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(d_coords, d_Q, d_recip, d_grid_real, N_atoms, K1, K2, K3);
+
+    spread_q_kernel<T, RANK><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(d_coords, d_Q, d_recip, d_grid_real, N_atoms, K1, K2, K3);
 
     // 2. Forward FFT (real to complex)
     auto grid_recip = torch::fft::rfftn(grid_3d).contiguous();
-    c10::complex<double>* grid_recip_ptr = grid_recip.data_ptr<c10::complex<double>>();
-    
+    c10::complex<T>* grid_recip_ptr = grid_recip.data_ptr<c10::complex<T>>();
+
     dim3 dimBlock(8, 8, 8);
     dim3 dimGrid((K1+7)/8, (K2+7)/8, (K3_complex+7)/8);
-    pme_convolution_fused_kernel<double><<<dimGrid, dimBlock, 0, stream>>>(grid_recip_ptr, d_recip, K1, K2, K3, alpha, volume);
+    pme_convolution_fused_kernel<T><<<dimGrid, dimBlock, 0, stream>>>(grid_recip_ptr, d_recip, K1, K2, K3, alpha, volume);
 
     // 3. Inverse FFT (complex to real)
     auto grid_real = torch::fft::irfftn(grid_recip, {K1, K2, K3}, c10::nullopt, "forward");
-    double* grid_real_ptr = grid_real.data_ptr<double>();
+    T* grid_real_ptr = grid_real.data_ptr<T>();
 
     // 4. Interpolate (AND FORCES)
-    interpolate_kernel<double, RANK><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(grid_real_ptr, d_coords, d_recip, d_Q, d_phi, d_E, d_EG, d_force, alpha, N_atoms, K1, K2, K3);
+    interpolate_kernel<T, RANK><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(grid_real_ptr, d_coords, d_recip, d_Q, d_phi, d_E, d_EG, d_force, alpha, N_atoms, K1, K2, K3);
 
 }
 
@@ -548,10 +550,9 @@ struct PMELongRangeFunction : public torch::autograd::Function<PMELongRangeFunct
         at::Tensor coords, at::Tensor box, at::Tensor q, at::Tensor p, at::Tensor t,
         at::Tensor K_t, at::Tensor rank_t, at::Tensor alpha_t
     ) {
-        TORCH_CHECK(coords.scalar_type() == at::kDouble, "Coords must be double");
-        TORCH_CHECK(q.scalar_type() == at::kDouble, "Charges must be double");
+        TORCH_CHECK(at::isFloatingType(coords.scalar_type()), "Coords must be float or double");
+        TORCH_CHECK(q.scalar_type() == coords.scalar_type(), "Charges must match coords dtype");
 
-        double alpha = alpha_t.item<double>();
         int rank = rank_t.item<int64_t>();
 
         // --- 1. Setup Grid & Geometry ---
@@ -562,8 +563,7 @@ struct PMELongRangeFunction : public torch::autograd::Function<PMELongRangeFunct
             auto k_acc = K_t.accessor<int64_t, 1>();
             K1 = k_acc[0]; K2 = k_acc[1]; K3 = k_acc[2];
         }
-        at::Tensor recip_vecs = torch::inverse(box).t().contiguous();
-        double volume = torch::det(box).item<double>();
+        at::Tensor recip_vecs = torch::inverse(box).t().contiguous().to(coords.dtype());
         int N = coords.size(0);
 
         // --- 2. Prepare Multipole Tensor ---
@@ -583,31 +583,35 @@ struct PMELongRangeFunction : public torch::autograd::Function<PMELongRangeFunct
         at::Tensor forces = torch::zeros({N, 3}, options);
 
         // --- 4. Run CUDA Pipeline (allocates its own grid internally) ---
-        if (rank == 0) {
-            compute_pme_cuda_pipeline<0>(coords, Q_combined, recip_vecs, phi, E, EG, forces, alpha, volume, K1, K2, K3);
-        } else if (rank == 1) {
-            compute_pme_cuda_pipeline<1>(coords, Q_combined, recip_vecs, phi, E, EG, forces, alpha, volume, K1, K2, K3);
-        } else {
-            compute_pme_cuda_pipeline<2>(coords, Q_combined, recip_vecs, phi, E, EG, forces, alpha, volume, K1, K2, K3);
-        }
+        AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "pme_long_range_forward", ([&] {
+            scalar_t alpha_val = static_cast<scalar_t>(alpha_t.item<double>());
+            scalar_t volume_val = static_cast<scalar_t>(torch::det(box).item<double>());
+            if (rank == 0) {
+                compute_pme_cuda_pipeline<scalar_t, 0>(coords, Q_combined, recip_vecs, phi, E, EG, forces, alpha_val, volume_val, K1, K2, K3);
+            } else if (rank == 1) {
+                compute_pme_cuda_pipeline<scalar_t, 1>(coords, Q_combined, recip_vecs, phi, E, EG, forces, alpha_val, volume_val, K1, K2, K3);
+            } else {
+                compute_pme_cuda_pipeline<scalar_t, 2>(coords, Q_combined, recip_vecs, phi, E, EG, forces, alpha_val, volume_val, K1, K2, K3);
+            }
 
-        // --- 5. Apply Self-Corrections ---
-        constexpr double INV_ROOT_PI = inv_root_pi<double>();
-        double alpha_over_root_pi = alpha * INV_ROOT_PI;
-        double alpha2 = alpha * alpha;
+            // --- 5. Apply Self-Corrections ---
+            constexpr scalar_t INV_ROOT_PI = inv_root_pi<scalar_t>();
+            scalar_t alpha_over_root_pi = alpha_val * INV_ROOT_PI;
+            scalar_t alpha2 = alpha_val * alpha_val;
 
-        phi.sub_(q * (2.0 * alpha_over_root_pi));
+            phi.sub_(q * (2.0 * alpha_over_root_pi));
 
-        if (rank >= 1) {
-            double factor_E = alpha_over_root_pi * (4.0 * alpha2 / 3.0);
-            E.add_(p * factor_E); // self-field
-        }
+            if (rank >= 1) {
+                scalar_t factor_E = alpha_over_root_pi * (4.0 * alpha2 / 3.0);
+                E.add_(p * factor_E); // self-field
+            }
 
-        if (rank >= 2) {
-            double alpha4 = alpha2 * alpha2;
-            double factor_EG = alpha_over_root_pi * (16.0 * alpha4 / 5.0) / 3.0;
-            EG.add_(t * factor_EG); // self-field-gradient
-        }
+            if (rank >= 2) {
+                scalar_t alpha4 = alpha2 * alpha2;
+                scalar_t factor_EG = alpha_over_root_pi * (16.0 * alpha4 / 5.0) / 3.0;
+                EG.add_(t * factor_EG); // self-field-gradient
+            }
+        }));
 
         // --- 6. Compute Total Energy ---
         at::Tensor energy = assemble_pme_energy_only(q, p, t, phi, E, EG, rank);
@@ -662,10 +666,6 @@ struct PMELongRangeFunction : public torch::autograd::Function<PMELongRangeFunct
         const at::Tensor& t               = saved[6];
 
         int64_t rank = rank_t.item<int64_t>();
-        double alpha = alpha_t.item<double>();
-        constexpr double INV_ROOT_PI = inv_root_pi<double>();
-        double alpha_over_root_pi = alpha * INV_ROOT_PI;
-        double alpha2 = alpha * alpha;
 
         // --- A. Compute d_coords (Forces on Atoms) ---
         at::Tensor dcoords = torch::zeros_like(forces_internal);
@@ -678,42 +678,48 @@ struct PMELongRangeFunction : public torch::autograd::Function<PMELongRangeFunct
             dcoords.sub_(forces_internal * scale);
         }
 
-        // --- B. Compute d_p (Torque on Dipoles) ---
+        // --- B. Compute d_p and d_t (type-generic factors) ---
         at::Tensor d_p;
-        if (rank >= 1 && g_energy.defined()) {
-            auto scale = (g_energy.dim()==0) ? g_energy : g_energy.view({1,1});
-            // dE/dp = -Field
-            // dL/dp = dL/dE * -E
-            double factor_E = alpha_over_root_pi * (4.0 * alpha2 / 3.0);
-
-            // dL/dp = g_energy * (-Field - 0.5 * factor_E * p)
-            d_p = (-field - (0.5 * factor_E * p)) * scale;
-        }
-
-        // --- C. Compute d_t (Torque on Quadrupoles) ---
         at::Tensor d_t;
-        if (rank >= 2 && g_energy.defined()) {
-            auto scale = (g_energy.dim() == 0) ? g_energy : g_energy.view({1, 1});
-            double alpha4 = alpha2 * alpha2;
-            double factor_EG = alpha_over_root_pi * (16.0 * alpha4 / 5.0) / 3.0;
-            // Extract field gradient components from the (N,3,3) tensor
-            auto EG_xx = field_grad.select(1, 0).select(1, 0);
-            auto EG_xy = field_grad.select(1, 0).select(1, 1);
-            auto EG_xz = field_grad.select(1, 0).select(1, 2);
-            auto EG_yy = field_grad.select(1, 1).select(1, 1);
-            auto EG_yz = field_grad.select(1, 1).select(1, 2);
-            auto EG_zz = field_grad.select(1, 2).select(1, 2);
+        AT_DISPATCH_FLOATING_TYPES(forces_internal.scalar_type(), "pme_long_range_backward", ([&] {
+            scalar_t alpha_val = static_cast<scalar_t>(alpha_t.item<double>());
+            constexpr scalar_t INV_ROOT_PI = inv_root_pi<scalar_t>();
+            scalar_t alpha_over_root_pi = alpha_val * INV_ROOT_PI;
+            scalar_t alpha2 = alpha_val * alpha_val;
 
-            // Apply 2.0 to off-diagonals and 0.5 * factor to diagonals
-            auto d_t_xx = (-EG_xx - 0.5 * factor_EG * t.select(1, 0)) * scale;
-            auto d_t_xy = (-EG_xy * 2.0) * scale;
-            auto d_t_xz = (-EG_xz * 2.0) * scale;
-            auto d_t_yy = (-EG_yy - 0.5 * factor_EG * t.select(1, 3)) * scale;
-            auto d_t_yz = (-EG_yz * 2.0) * scale;
-            auto d_t_zz = (-EG_zz - 0.5 * factor_EG * t.select(1, 5)) * scale;
+            if (rank >= 1 && g_energy.defined()) {
+                auto scale = (g_energy.dim()==0) ? g_energy : g_energy.view({1,1});
+                // dE/dp = -Field
+                // dL/dp = dL/dE * -E
+                scalar_t factor_E = alpha_over_root_pi * (4.0 * alpha2 / 3.0);
 
-            d_t = torch::stack({d_t_xx, d_t_xy, d_t_xz, d_t_yy, d_t_yz, d_t_zz}, 1);
-        }
+                // dL/dp = g_energy * (-Field - 0.5 * factor_E * p)
+                d_p = (-field - (0.5 * factor_E * p)) * scale;
+            }
+
+            if (rank >= 2 && g_energy.defined()) {
+                auto scale = (g_energy.dim() == 0) ? g_energy : g_energy.view({1, 1});
+                scalar_t alpha4 = alpha2 * alpha2;
+                scalar_t factor_EG = alpha_over_root_pi * (16.0 * alpha4 / 5.0) / 3.0;
+                // Extract field gradient components from the (N,3,3) tensor
+                auto EG_xx = field_grad.select(1, 0).select(1, 0);
+                auto EG_xy = field_grad.select(1, 0).select(1, 1);
+                auto EG_xz = field_grad.select(1, 0).select(1, 2);
+                auto EG_yy = field_grad.select(1, 1).select(1, 1);
+                auto EG_yz = field_grad.select(1, 1).select(1, 2);
+                auto EG_zz = field_grad.select(1, 2).select(1, 2);
+
+                // Apply 2.0 to off-diagonals and 0.5 * factor to diagonals
+                auto d_t_xx = (-EG_xx - 0.5 * factor_EG * t.select(1, 0)) * scale;
+                auto d_t_xy = (-EG_xy * 2.0) * scale;
+                auto d_t_xz = (-EG_xz * 2.0) * scale;
+                auto d_t_yy = (-EG_yy - 0.5 * factor_EG * t.select(1, 3)) * scale;
+                auto d_t_yz = (-EG_yz * 2.0) * scale;
+                auto d_t_zz = (-EG_zz - 0.5 * factor_EG * t.select(1, 5)) * scale;
+
+                d_t = torch::stack({d_t_xx, d_t_xy, d_t_xz, d_t_yy, d_t_yz, d_t_zz}, 1);
+            }
+        }));
 
         // --- Output List ---
         return {
