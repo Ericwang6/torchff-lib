@@ -13,85 +13,85 @@
 // ============================================================================
 // 2. Spread Kernel
 // ============================================================================
-template <int RANK>
+template <typename T, int RANK>
 __global__ void spread_q_kernel(
-    const double* __restrict__ coords,
-    const double* __restrict__ Q,
-    const double* __restrict__ recip_vecs,
-    double* __restrict__ grid,
+    const T* __restrict__ coords,
+    const T* __restrict__ Q,
+    const T* __restrict__ recip_vecs,
+    T* __restrict__ grid,
     int N_atoms,
     int K1, int K2, int K3
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N_atoms) return;
 	
-    double n_star[3][3];
+    T n_star[3][3];
     #pragma unroll
     for(int i=0; i<3; i++)
         #pragma unroll
         for(int j=0; j<3; j++)
             n_star[i][j] = recip_vecs[i*3 + j];
 
-    double r[3];
+    T r[3];
     r[0] = coords[idx * 3 + 0]; r[1] = coords[idx * 3 + 1]; r[2] = coords[idx * 3 + 2];
 
     int   m_u0[3];
-    double u_frac[3];
-    double grid_K[3] = {(double)K1, (double)K2, (double)K3};
+    T u_frac[3];
+    T grid_K[3] = {(T)K1, (T)K2, (T)K3};
 
     #pragma unroll
     for(int i=0; i<3; i++) {
-        double val = (n_star[i][0]*r[0] + n_star[i][1]*r[1] + n_star[i][2]*r[2]) * grid_K[i];
+        T val = (n_star[i][0]*r[0] + n_star[i][1]*r[1] + n_star[i][2]*r[2]) * grid_K[i];
         m_u0[i] = (int)ceil(val);
-        u_frac[i] = ( (double)m_u0[i] - val) + 3.0;
+        u_frac[i] = ( (T)m_u0[i] - val) + (T)3.0;
     }
 
-    double M[3][6], dM[3][6], d2M[3][6];
+    T M[3][6], dM[3][6], d2M[3][6];
     //Calculate B-Spline and derivatives
     #pragma unroll
     for(int d=0; d<3; d++) {
         #pragma unroll
         for(int k=0; k<6; k++) {
-            double u_eval = u_frac[d] + (double)(k - 3);
-            eval_b6_and_derivs<double>(u_eval, &M[d][k], &dM[d][k], &d2M[d][k]);
+            T u_eval = u_frac[d] + (T)(k - 3);
+            eval_b6_and_derivs<T>(u_eval, &M[d][k], &dM[d][k], &d2M[d][k]);
         }
     }
     //Initialize monopoles
-    double q_val = Q[idx * 10 + 0];
+    T q_val = Q[idx * 10 + 0];
     #pragma unroll 6
     for (int iz = 0; iz < 6; iz++) {
         int gz = (m_u0[2] + (iz - 3) + 1000 * K3) % K3;
-        double Mz = M[2][iz];
-        double dMz = (RANK >= 1) ? dM[2][iz] : 0.0;
-        double d2Mz = (RANK >= 2) ? d2M[2][iz] : 0.0;
+        T Mz = M[2][iz];
+        T dMz = (RANK >= 1) ? dM[2][iz] : (T)0.0;
+        T d2Mz = (RANK >= 2) ? d2M[2][iz] : (T)0.0;
 
         #pragma unroll 6
         for (int iy = 0; iy < 6; iy++) {
             int gy = (m_u0[1] + (iy - 3) + 1000 * K2) % K2;
-            double My = M[1][iy];
-            double dMy = (RANK >= 1) ? dM[1][iy] : 0.0;
-            double d2My = (RANK >= 2) ? d2M[1][iy] : 0.0;
+            T My = M[1][iy];
+            T dMy = (RANK >= 1) ? dM[1][iy] : (T)0.0;
+            T d2My = (RANK >= 2) ? d2M[1][iy] : (T)0.0;
 
             #pragma unroll 6
             for (int ix = 0; ix < 6; ix++) {
                 int gx = (m_u0[0] + (ix - 3) + 1000 * K1) % K1;
-                double Mx = M[0][ix];
-                double dMx = (RANK >= 1) ? dM[0][ix] : 0.0;
-                double d2Mx = (RANK >= 2) ? d2M[0][ix] : 0.0;
+                T Mx = M[0][ix];
+                T dMx = (RANK >= 1) ? dM[0][ix] : (T)0.0;
+                T d2Mx = (RANK >= 2) ? d2M[0][ix] : (T)0.0;
 
-                double theta = Mx * My * Mz;
-                double term = q_val * theta;
+                T theta = Mx * My * Mz;
+                T term = q_val * theta;
 
                 if (RANK >= 1) {
 		    //initialize dipoles
-        	    double px = Q[idx * 10 + 1]; double py = Q[idx * 10 + 2]; double pz = Q[idx * 10 + 3];
+        	    T px = Q[idx * 10 + 1]; T py = Q[idx * 10 + 2]; T pz = Q[idx * 10 + 3];
 		    //initialize b-spline derivative
-                    double dt_du[3];
+                    T dt_du[3];
                     dt_du[0] = dMx * My * Mz;
                     dt_du[1] = Mx * dMy * Mz;
                     dt_du[2] = Mx * My * dMz;
 
-                    double dt_dr[3] = {0,0,0};
+                    T dt_dr[3] = {(T)0,(T)0,(T)0};
                     #pragma unroll
                     for(int i=0; i<3; i++) {
                         dt_dr[0] += n_star[i][0] * grid_K[i] * dt_du[i];
@@ -101,16 +101,16 @@ __global__ void spread_q_kernel(
                     term -= px * dt_dr[0] + py * dt_dr[1] + pz * dt_dr[2];
 		if (RANK >= 2) {
                          // 1. Load Cartesian Quadrupoles
-                         double Qxx = Q[idx * 10 + 4];
-                         double Qxy = Q[idx * 10 + 5];
-                         double Qxz = Q[idx * 10 + 6];
-                         double Qyy = Q[idx * 10 + 7];
-                         double Qyz = Q[idx * 10 + 8];
-                         double Qzz = Q[idx * 10 + 9];
+                         T Qxx = Q[idx * 10 + 4];
+                         T Qxy = Q[idx * 10 + 5];
+                         T Qxz = Q[idx * 10 + 6];
+                         T Qyy = Q[idx * 10 + 7];
+                         T Qyz = Q[idx * 10 + 8];
+                         T Qzz = Q[idx * 10 + 9];
 
                          // 2. Compute Transformation Matrix A = K * n_star
                          // A maps Cartesian coords (r) to Grid coords (u)
-                         double A[3][3];
+                         T A[3][3];
                          #pragma unroll
                          for(int i=0; i<3; i++)
                              for(int j=0; j<3; j++)
@@ -118,53 +118,53 @@ __global__ void spread_q_kernel(
 
                          // 3. Transform Q_cart to Q_lat
                          // Q_lat = A * Q_cart * A^T
-                         double Q_cart[3][3];
+                         T Q_cart[3][3];
                          Q_cart[0][0]=Qxx; Q_cart[0][1]=Qxy; Q_cart[0][2]=Qxz;
                          Q_cart[1][0]=Qxy; Q_cart[1][1]=Qyy; Q_cart[1][2]=Qyz;
                          Q_cart[2][0]=Qxz; Q_cart[2][1]=Qyz; Q_cart[2][2]=Qzz;
 
-                         double Q_temp[3][3] = {0};
+                         T Q_temp[3][3] = {(T)0};
                          #pragma unroll
                          for(int i=0; i<3; i++)
                              for(int j=0; j<3; j++)
                                  for(int k=0; k<3; k++)
                                      Q_temp[i][j] += Q_cart[i][k] * A[j][k]; // Q * A^T (symmetric)
 
-                         double Q_lat[3][3] = {0};
+                         T Q_lat[3][3] = {(T)0};
                          #pragma unroll
                          for(int i=0; i<3; i++)
                              for(int j=0; j<3; j++)
                                  for(int k=0; k<3; k++)
                                      Q_lat[i][j] += A[i][k] * Q_temp[k][j]; // A * (Q * A^T)
 
-                         double Q_lat_xx = Q_lat[0][0]; double Q_lat_yy = Q_lat[1][1]; double Q_lat_zz = Q_lat[2][2];
-                         double Q_lat_xy = Q_lat[0][1]; double Q_lat_xz = Q_lat[0][2]; double Q_lat_yz = Q_lat[1][2];
+                         T Q_lat_xx = Q_lat[0][0]; T Q_lat_yy = Q_lat[1][1]; T Q_lat_zz = Q_lat[2][2];
+                         T Q_lat_xy = Q_lat[0][1]; T Q_lat_xz = Q_lat[0][2]; T Q_lat_yz = Q_lat[1][2];
 
                          // 4. Compute B-Spline Lattice Hessians (Hu_vals)
-                         double d2t_du2[3];
+                         T d2t_du2[3];
                          d2t_du2[0] = d2Mx * My * Mz;
                          d2t_du2[1] = Mx * d2My * Mz;
                          d2t_du2[2] = Mx * My * d2Mz;
-                         double d2t_du_mix[3];
+                         T d2t_du_mix[3];
                          d2t_du_mix[0] = dMx * dMy * Mz;
                          d2t_du_mix[1] = dMx * My * dMz;
                          d2t_du_mix[2] = Mx * dMy * dMz;
                          
-                         double Hu_vals[3][3];
+                         T Hu_vals[3][3];
                          Hu_vals[0][0] = d2t_du2[0]; Hu_vals[1][1] = d2t_du2[1]; Hu_vals[2][2] = d2t_du2[2];
                          Hu_vals[0][1] = d2t_du_mix[0]; 
                          Hu_vals[0][2] = d2t_du_mix[1]; 
                          Hu_vals[1][2] = d2t_du_mix[2];
 
                          // 5. Contract Lattice Quadrupole with Lattice Hessian
-                         double interaction = Q_lat_xx * Hu_vals[0][0] + 
+                         T interaction = Q_lat_xx * Hu_vals[0][0] + 
                                               Q_lat_yy * Hu_vals[1][1] + 
                                               Q_lat_zz * Hu_vals[2][2] + 
-                                              2.0 * (Q_lat_xy * Hu_vals[0][1] + 
+                                              (T)2.0 * (Q_lat_xy * Hu_vals[0][1] + 
                                                      Q_lat_xz * Hu_vals[0][2] + 
                                                      Q_lat_yz * Hu_vals[1][2]);
                          
-                         interaction *= 0.5;
+                         interaction *= (T)0.5;
                          term += interaction;
                     }
 
@@ -179,17 +179,17 @@ __global__ void spread_q_kernel(
 // ============================================================================
 // 3. Interpolate back to atoms potentials, fields, field gradients, and compute forces
 // ============================================================================
-template <int RANK>
+template <typename T, int RANK>
 __global__ void interpolate_kernel(
-    const double* __restrict__ grid,
-    const double* __restrict__ coords,
-    const double* __restrict__ recip_vecs,
-    const double* __restrict__ Q,
-    double* __restrict__ phi_atoms,
-    double* __restrict__ E_atoms,
-    double* __restrict__ EG_atoms,
-    double* __restrict__ force_atoms,
-    double alpha,
+    const T* __restrict__ grid,
+    const T* __restrict__ coords,
+    const T* __restrict__ recip_vecs,
+    const T* __restrict__ Q,
+    T* __restrict__ phi_atoms,
+    T* __restrict__ E_atoms,
+    T* __restrict__ EG_atoms,
+    T* __restrict__ force_atoms,
+    T alpha,
     int N_atoms,
     int K1, int K2, int K3
 ) {
@@ -197,80 +197,80 @@ __global__ void interpolate_kernel(
     if (idx >= N_atoms) return;
 
     // --- 1. Geometry Setup ---
-    double n_star[3][3];
+    T n_star[3][3];
     #pragma unroll
     for(int i=0; i<3; i++)
         #pragma unroll
         for(int j=0; j<3; j++)
             n_star[i][j] = recip_vecs[i*3 + j];
 
-    double r[3] = {coords[idx*3+0], coords[idx*3+1], coords[idx*3+2]};
-    double grid_K[3] = {(double)K1, (double)K2, (double)K3};
+    T r[3] = {coords[idx*3+0], coords[idx*3+1], coords[idx*3+2]};
+    T grid_K[3] = {(T)K1, (T)K2, (T)K3};
 
     int m_u0[3];
-    double u_frac[3];
+    T u_frac[3];
 
     #pragma unroll
     for(int i=0; i<3; i++) {
-        double val = (n_star[i][0]*r[0] + n_star[i][1]*r[1] + n_star[i][2]*r[2]) * grid_K[i];
+        T val = (n_star[i][0]*r[0] + n_star[i][1]*r[1] + n_star[i][2]*r[2]) * grid_K[i];
         m_u0[i] = (int)ceil(val);
-        u_frac[i] = ((double)m_u0[i] - val) + 3.0;
+        u_frac[i] = ((T)m_u0[i] - val) + (T)3.0;
     }
 
     // --- 2. B-Spline Evaluation ---
-    double M[3][6], dM[3][6], d2M[3][6], d3M[3][6];
+    T M[3][6], dM[3][6], d2M[3][6], d3M[3][6];
     #pragma unroll
     for(int d=0; d<3; d++) {
         #pragma unroll
         for(int k=0; k<6; k++) {
-            double u_eval = u_frac[d] + (double)(k - 3);
-            eval_b6_and_derivs<double>(u_eval, &M[d][k], &dM[d][k], &d2M[d][k], &d3M[d][k]);
+            T u_eval = u_frac[d] + (T)(k - 3);
+            eval_b6_and_derivs<T>(u_eval, &M[d][k], &dM[d][k], &d2M[d][k], &d3M[d][k]);
         }
     }
 
     // --- 3. Multipole Setup ---
-    double q_val = Q[idx * 10 + 0];
+    T q_val = Q[idx * 10 + 0];
 
     // Dipoles
-    double p_lat[3] = {0.0};
+    T p_lat[3] = {(T)0.0};
     if (RANK >= 1) {
-        double px = Q[idx * 10 + 1];
-        double py = Q[idx * 10 + 2];
-        double pz = Q[idx * 10 + 3];
+        T px = Q[idx * 10 + 1];
+        T py = Q[idx * 10 + 2];
+        T pz = Q[idx * 10 + 3];
         #pragma unroll
         for(int i=0; i<3; i++)
             p_lat[i] = (px * n_star[i][0] + py * n_star[i][1] + pz * n_star[i][2]) * grid_K[i];
     }
 
     // Quadrupoles
-    double Q_lat[6] = {0.0};
+    T Q_lat[6] = {(T)0.0};
     if (RANK >= 2) {
 	//Initialize quadrupoles
-        double Qxx = Q[idx * 10 + 4];
-        double Qxy = Q[idx * 10 + 5];
-        double Qxz = Q[idx * 10 + 6];
-        double Qyy = Q[idx * 10 + 7];
-        double Qyz = Q[idx * 10 + 8];
-        double Qzz = Q[idx * 10 + 9];
+        T Qxx = Q[idx * 10 + 4];
+        T Qxy = Q[idx * 10 + 5];
+        T Qxz = Q[idx * 10 + 6];
+        T Qyy = Q[idx * 10 + 7];
+        T Qyz = Q[idx * 10 + 8];
+        T Qzz = Q[idx * 10 + 9];
 
-        double Q_cart[3][3];
+        T Q_cart[3][3];
         Q_cart[0][0]=Qxx; Q_cart[0][1]=Qxy; Q_cart[0][2]=Qxz;
         Q_cart[1][0]=Qxy; Q_cart[1][1]=Qyy; Q_cart[1][2]=Qyz;
         Q_cart[2][0]=Qxz; Q_cart[2][1]=Qyz; Q_cart[2][2]=Qzz;
 
-        double A[3][3];
+        T A[3][3];
         #pragma unroll
         for(int i=0; i<3; i++)
             for(int j=0; j<3; j++)
                 A[i][j] = grid_K[i] * n_star[i][j];
 
-        double Q_temp[3][3] = {0};
+        T Q_temp[3][3] = {0};
         for(int i=0; i<3; i++)
             for(int j=0; j<3; j++)
                 for(int k=0; k<3; k++)
                     Q_temp[i][j] += Q_cart[i][k] * A[j][k];
 
-        double Q_L[3][3] = {0};
+        T Q_L[3][3] = {0};
         for(int i=0; i<3; i++)
             for(int j=0; j<3; j++)
                 for(int k=0; k<3; k++)
@@ -281,31 +281,31 @@ __global__ void interpolate_kernel(
     }
 
     // --- 4. Grid Accumulation ---
-    double phi_acc = 0.0;
-    double grad_lat[3] = {0.0};
-    double hess_p_lat[3] = {0.0};
-    double grad_Q_lat[3] = {0.0};
-    double hess_lat[6] = {0.0};
+    T phi_acc = (T)0.0;
+    T grad_lat[3] = {(T)0.0};
+    T hess_p_lat[3] = {(T)0.0};
+    T grad_Q_lat[3] = {(T)0.0};
+    T hess_lat[6] = {(T)0.0};
 
     #pragma unroll 6
     for (int iz = 0; iz < 6; iz++) {
         int gz = (m_u0[2] + (iz - 3) + 1000 * K3) % K3;
-        double Mz = M[2][iz]; double dMz = dM[2][iz];
-        double d2Mz = (RANK>=1)?d2M[2][iz]:0; double d3Mz = (RANK>=2)?d3M[2][iz]:0;
+        T Mz = M[2][iz]; T dMz = dM[2][iz];
+        T d2Mz = (RANK>=1)?d2M[2][iz]:(T)0; T d3Mz = (RANK>=2)?d3M[2][iz]:(T)0;
 
         #pragma unroll 6
         for (int iy = 0; iy < 6; iy++) {
             int gy = (m_u0[1] + (iy - 3) + 1000 * K2) % K2;
-            double My = M[1][iy]; double dMy = dM[1][iy];
-            double d2My = (RANK>=1)?d2M[1][iy]:0; double d3My = (RANK>=2)?d3M[1][iy]:0;
+            T My = M[1][iy]; T dMy = dM[1][iy];
+            T d2My = (RANK>=1)?d2M[1][iy]:(T)0; T d3My = (RANK>=2)?d3M[1][iy]:(T)0;
 
             #pragma unroll 6
             for (int ix = 0; ix < 6; ix++) {
                 int gx = (m_u0[0] + (ix - 3) + 1000 * K1) % K1;
-                double Mx = M[0][ix]; double dMx = dM[0][ix];
-                double d2Mx = (RANK>=1)?d2M[0][ix]:0; double d3Mx = (RANK>=2)?d3M[0][ix]:0;
+                T Mx = M[0][ix]; T dMx = dM[0][ix];
+                T d2Mx = (RANK>=1)?d2M[0][ix]:(T)0; T d3Mx = (RANK>=2)?d3M[0][ix]:(T)0;
 
-                double val = grid[gx * K2 * K3 + gy * K3 + gz];
+                T val = grid[gx * K2 * K3 + gy * K3 + gz];
 
                 phi_acc      += (Mx * My * Mz) * val;
                 grad_lat[0]  += (dMx * My * Mz) * val;
@@ -313,12 +313,12 @@ __global__ void interpolate_kernel(
                 grad_lat[2]  += (Mx * My * dMz) * val;
 
                 if (RANK >= 1) {
-                    double H_uu = d2Mx * My * Mz;
-                    double H_vv = Mx * d2My * Mz;
-                    double H_ww = Mx * My * d2Mz;
-                    double H_uv = dMx * dMy * Mz;
-                    double H_uw = dMx * My * dMz;
-                    double H_vw = Mx * dMy * dMz;
+                    T H_uu = d2Mx * My * Mz;
+                    T H_vv = Mx * d2My * Mz;
+                    T H_ww = Mx * My * d2Mz;
+                    T H_uv = dMx * dMy * Mz;
+                    T H_uw = dMx * My * dMz;
+                    T H_vw = Mx * dMy * dMz;
 
                     hess_lat[0] += H_uu * val; hess_lat[1] += H_vv * val; hess_lat[2] += H_ww * val;
                     hess_lat[3] += H_uv * val; hess_lat[4] += H_uw * val; hess_lat[5] += H_vw * val;
@@ -328,23 +328,23 @@ __global__ void interpolate_kernel(
                     hess_p_lat[2] += (p_lat[0]*H_uw + p_lat[1]*H_vw + p_lat[2]*H_ww) * val;
 
                     if (RANK >= 2) {
-                        double T_uuu = d3Mx * My * Mz;
-                        double T_vvv = Mx * d3My * Mz;
-                        double T_www = Mx * My * d3Mz;
-                        double T_uuv = d2Mx * dMy * Mz;
-                        double T_uuw = d2Mx * My * dMz;
-                        double T_uvv = dMx * d2My * Mz;
-                        double T_vvw = Mx * d2My * dMz;
-                        double T_uww = dMx * My * d2Mz;
-                        double T_vww = Mx * dMy * d2Mz;
-                        double T_uvw = dMx * dMy * dMz;
+                        T T_uuu = d3Mx * My * Mz;
+                        T T_vvv = Mx * d3My * Mz;
+                        T T_www = Mx * My * d3Mz;
+                        T T_uuv = d2Mx * dMy * Mz;
+                        T T_uuw = d2Mx * My * dMz;
+                        T T_uvv = dMx * d2My * Mz;
+                        T T_vvw = Mx * d2My * dMz;
+                        T T_uww = dMx * My * d2Mz;
+                        T T_vww = Mx * dMy * d2Mz;
+                        T T_uvw = dMx * dMy * dMz;
 
-                        double dE_du = 0.5 * (Q_lat[0]*T_uuu + Q_lat[1]*T_uvv + Q_lat[2]*T_uww +
-                                              2.0*(Q_lat[3]*T_uuv + Q_lat[4]*T_uuw + Q_lat[5]*T_uvw));
-                        double dE_dv = 0.5 * (Q_lat[0]*T_uuv + Q_lat[1]*T_vvv + Q_lat[2]*T_vww +
-                                              2.0*(Q_lat[3]*T_uvv + Q_lat[4]*T_uvw + Q_lat[5]*T_vvw));
-                        double dE_dw = 0.5 * (Q_lat[0]*T_uuw + Q_lat[1]*T_vvw + Q_lat[2]*T_www +
-                                              2.0*(Q_lat[3]*T_uvw + Q_lat[4]*T_uww + Q_lat[5]*T_vww));
+                        T dE_du = (T)0.5 * (Q_lat[0]*T_uuu + Q_lat[1]*T_uvv + Q_lat[2]*T_uww +
+                                              (T)2.0*(Q_lat[3]*T_uuv + Q_lat[4]*T_uuw + Q_lat[5]*T_uvw));
+                        T dE_dv = (T)0.5 * (Q_lat[0]*T_uuv + Q_lat[1]*T_vvv + Q_lat[2]*T_vww +
+                                              (T)2.0*(Q_lat[3]*T_uvv + Q_lat[4]*T_uvw + Q_lat[5]*T_vvw));
+                        T dE_dw = (T)0.5 * (Q_lat[0]*T_uuw + Q_lat[1]*T_vvw + Q_lat[2]*T_www +
+                                              (T)2.0*(Q_lat[3]*T_uvw + Q_lat[4]*T_uww + Q_lat[5]*T_vww));
 
                         grad_Q_lat[0] += dE_du * val;
                         grad_Q_lat[1] += dE_dv * val;
@@ -360,7 +360,7 @@ __global__ void interpolate_kernel(
     phi_atoms[idx] = phi_acc;
 
     // Transform Gradients (Lattice -> Cartesian)
-    double grad_cart[3] = {0.0};
+    T grad_cart[3] = {(T)0.0};
     #pragma unroll
     for(int x=0; x<3; x++) {
         grad_cart[x] = grad_lat[0] * (n_star[0][x] * grid_K[0]) +
@@ -374,7 +374,7 @@ __global__ void interpolate_kernel(
         E_atoms[idx * 3 + 2] = grad_cart[2];
     }
 
-    double grad_U_dip[3] = {0.0};
+    T grad_U_dip[3] = {(T)0.0};
     if (RANK >= 1) {
         #pragma unroll
         for(int x=0; x<3; x++) {
@@ -384,7 +384,7 @@ __global__ void interpolate_kernel(
         }
     }
 
-    double grad_U_quad[3] = {0.0};
+    T grad_U_quad[3] = {(T)0.0};
     if (RANK >= 2) {
         // Transform Force from Quadrupoles
         #pragma unroll
@@ -395,27 +395,27 @@ __global__ void interpolate_kernel(
         }
 
         // Transform EFG
-        double H_lat_mat[3][3];
+        T H_lat_mat[3][3];
         H_lat_mat[0][0]=hess_lat[0]; H_lat_mat[1][1]=hess_lat[1]; H_lat_mat[2][2]=hess_lat[2];
         H_lat_mat[0][1]=H_lat_mat[1][0]=hess_lat[3];
         H_lat_mat[0][2]=H_lat_mat[2][0]=hess_lat[4];
         H_lat_mat[1][2]=H_lat_mat[2][1]=hess_lat[5];
 
-        double A_mat[3][3];
+        T A_mat[3][3];
         for(int i=0; i<3; i++) for(int j=0; j<3; j++) A_mat[i][j] = grid_K[i] * n_star[i][j];
 
-        double temp[3][3] = {0};
+        T temp[3][3] = {0};
         for(int i=0; i<3; i++)
             for(int j=0; j<3; j++)
                 for(int k=0; k<3; k++)
                     temp[i][j] += A_mat[k][i] * H_lat_mat[k][j];
 
-        double EFG[3][3] = {0};
+        T EFG[3][3] = {0};
         for(int i=0; i<3; i++)
             for(int j=0; j<3; j++)
                 for(int k=0; k<3; k++)
                     EFG[i][j] += temp[i][k] * A_mat[k][j];
-	double factor = -0.5;
+	T factor = (T)-0.5;
         EG_atoms[idx*6 + 0] = EFG[0][0] * factor;
         EG_atoms[idx*6 + 1] = EFG[0][1] * factor;
         EG_atoms[idx*6 + 2] = EFG[0][2] * factor;
@@ -428,37 +428,16 @@ __global__ void interpolate_kernel(
     force_atoms[idx*3 + 1] = (q_val * grad_cart[1] - grad_U_dip[1] + grad_U_quad[1]);
     force_atoms[idx*3 + 2] = (q_val * grad_cart[2] - grad_U_dip[2] + grad_U_quad[2]);
 }
-// ============================================================================
-// 4. Combined B-Spline Helper & Convolution
-// ============================================================================
-__device__ __forceinline__ double get_bspline_coeff_order6(int i) {
-    switch(i) {
-        case 1: return 1.0 / 120.0;
-        case 2: return 26.0 / 120.0;
-        case 3: return 66.0 / 120.0; 
-        case 4: return 26.0 / 120.0;
-        case 5: return 1.0 / 120.0;
-        default: return 0.0; 
-    }
-}
-__device__ __forceinline__ double get_bspline_modulus_device(int k, int K, int order) {
-    constexpr double TWOPI = two_pi<double>();
-    double sum_val = 0.0;
-    int half = order / 2; 
-    for (int m = -half; m < half; m++) {
-        double b_val = (order == 6) ? get_bspline_coeff_order6(m + half) : 0.0;
-        double arg = (TWOPI * (double)m * (double)k) / (double)K;
-        sum_val += b_val * cos(arg);
-    }
-    return sum_val;
-}
 
+
+
+template <typename T>
 __global__ void pme_convolution_fused_kernel(
-    c10::complex<double>* __restrict__ grid_recip,
-    const double* __restrict__ d_recip,
+    c10::complex<T>* __restrict__ grid_recip,
+    const T* __restrict__ d_recip,
     int K1, int K2, int K3,
-    double alpha,
-    double V
+    T alpha,
+    T V
 ) {
     int idx_x = blockIdx.x * blockDim.x + threadIdx.x;
     int idx_y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -468,25 +447,24 @@ __global__ void pme_convolution_fused_kernel(
     int flat_idx = idx_x * K2 * K3_complex + idx_y * K3_complex + idx_z;
 
     if (idx_x == 0 && idx_y == 0 && idx_z == 0) {
-        // d_grid_real[flat_idx] = 0.0; d_grid_imag[flat_idx] = 0.0; return;
-        grid_recip[flat_idx] = c10::complex<double>(0.0, 0.0); return;
+        grid_recip[flat_idx] = c10::complex<T>((T)0.0, (T)0.0); return;
     }
-    constexpr double TWOPI = two_pi<double>();
-    double mx = (idx_x <= K1/2) ? (double)idx_x : (double)(idx_x - K1);
-    double my = (idx_y <= K2/2) ? (double)idx_y : (double)(idx_y - K2);
-    double mz = (double)idx_z; 
-    double kx = TWOPI * (mx * d_recip[0] + my * d_recip[3] + mz * d_recip[6]);
-    double ky = TWOPI * (mx * d_recip[1] + my * d_recip[4] + mz * d_recip[7]);
-    double kz = TWOPI * (mx * d_recip[2] + my * d_recip[5] + mz * d_recip[8]);
-    double ksq = kx*kx + ky*ky + kz*kz;
-    double C_k = (2.0 * TWOPI / (V * ksq)) * exp(-ksq / (4.0 * alpha * alpha));
-    double theta_x = get_bspline_modulus_device(idx_x, K1, 6);
-    double theta_y = get_bspline_modulus_device(idx_y, K2, 6);
-    double theta_z = get_bspline_modulus_device(idx_z, K3, 6);
-    double theta = theta_x * theta_y * theta_z;
-    double theta_sq = theta * theta;
-    double scale_factor = (1.0 / theta_sq);
-    double factor = C_k * scale_factor;
+    constexpr T TWOPI = two_pi<T>();
+    T mx = (idx_x <= K1/2) ? (T)idx_x : (T)(idx_x - K1);
+    T my = (idx_y <= K2/2) ? (T)idx_y : (T)(idx_y - K2);
+    T mz = (T)idx_z; 
+    T kx = TWOPI * (mx * d_recip[0] + my * d_recip[3] + mz * d_recip[6]);
+    T ky = TWOPI * (mx * d_recip[1] + my * d_recip[4] + mz * d_recip[7]);
+    T kz = TWOPI * (mx * d_recip[2] + my * d_recip[5] + mz * d_recip[8]);
+    T ksq = kx*kx + ky*ky + kz*kz;
+    T C_k = ((T)2.0 * TWOPI / (V * ksq)) * exp(-ksq / ((T)4.0 * alpha * alpha));
+    T theta_x = get_bspline_modulus_device<T>(idx_x, K1, 6);
+    T theta_y = get_bspline_modulus_device<T>(idx_y, K2, 6);
+    T theta_z = get_bspline_modulus_device<T>(idx_z, K3, 6);
+    T theta = theta_x * theta_y * theta_z;
+    T theta_sq = theta * theta;
+    T scale_factor = ((T)1.0 / theta_sq);
+    T factor = C_k * scale_factor;
     grid_recip[flat_idx] *= factor;
 }
 
@@ -520,7 +498,7 @@ void compute_pme_cuda_pipeline(
     constexpr int BLOCK_SIZE = 256;
     int GRID_SIZE = (N_atoms + BLOCK_SIZE - 1) / BLOCK_SIZE;
     
-    spread_q_kernel<RANK><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(d_coords, d_Q, d_recip, d_grid_real, N_atoms, K1, K2, K3);
+    spread_q_kernel<double, RANK><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(d_coords, d_Q, d_recip, d_grid_real, N_atoms, K1, K2, K3);
 
     // 2. Forward FFT (real to complex)
     auto grid_recip = torch::fft::rfftn(grid_3d).contiguous();
@@ -528,14 +506,14 @@ void compute_pme_cuda_pipeline(
     
     dim3 dimBlock(8, 8, 8);
     dim3 dimGrid((K1+7)/8, (K2+7)/8, (K3_complex+7)/8);
-    pme_convolution_fused_kernel<<<dimGrid, dimBlock, 0, stream>>>(grid_recip_ptr, d_recip, K1, K2, K3, alpha, volume);
+    pme_convolution_fused_kernel<double><<<dimGrid, dimBlock, 0, stream>>>(grid_recip_ptr, d_recip, K1, K2, K3, alpha, volume);
 
     // 3. Inverse FFT (complex to real)
     auto grid_real = torch::fft::irfftn(grid_recip, {K1, K2, K3}, c10::nullopt, "forward");
     double* grid_real_ptr = grid_real.data_ptr<double>();
 
     // 4. Interpolate (AND FORCES)
-    interpolate_kernel<RANK><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(grid_real_ptr, d_coords, d_recip, d_Q, d_phi, d_E, d_EG, d_force, alpha, N_atoms, K1, K2, K3);
+    interpolate_kernel<double, RANK><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(grid_real_ptr, d_coords, d_recip, d_Q, d_phi, d_E, d_EG, d_force, alpha, N_atoms, K1, K2, K3);
 
 }
 

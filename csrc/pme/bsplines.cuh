@@ -97,4 +97,30 @@ __device__ __forceinline__ void eval_b6_and_derivs(T u, T* val, T* d1, T* d2, T*
     }
 }
 
+
+template <typename T>
+__device__ __forceinline__ T get_bspline_coeff_order6(int i) {
+    switch(i) {
+        case 1: return 1.0 / 120.0;
+        case 2: return 26.0 / 120.0;
+        case 3: return 66.0 / 120.0; 
+        case 4: return 26.0 / 120.0;
+        case 5: return 1.0 / 120.0;
+        default: return 0.0; 
+    }
+}
+
+template <typename T>
+__device__ __forceinline__ T get_bspline_modulus_device(int k, int K, int order) {
+    constexpr T TWOPI = two_pi<T>();
+    T sum_val = (T)0.0;
+    int half = order / 2; 
+    for (int m = -half; m < half; m++) {
+        T b_val = (order == 6) ? get_bspline_coeff_order6<T>(m + half) : (T)0.0;
+        T arg = (TWOPI * (T)m * (T)k) / (T)K;
+        sum_val += b_val * cos(arg);
+    }
+    return sum_val;
+}
+
 #endif // BSPLINES_CUH
