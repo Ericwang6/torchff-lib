@@ -9,6 +9,7 @@
 #include <c10/util/complex.h>
 #include "bsplines.cuh"
 #include "common/constants.cuh"
+#include "common/pbc.cuh"
 
 // ============================================================================
 // 2. Spread Kernel
@@ -17,16 +18,22 @@ template <typename T, int RANK>
 __global__ void spread_q_kernel(
     const T* __restrict__ coords,
     const T* __restrict__ Q,
-    const T* __restrict__ recip_vecs,
+    const T* __restrict__ box,
     T* __restrict__ grid,
     int N_atoms,
     int K1, int K2, int K3
 ) {
+    __shared__ T s_box_inv[9];
     __shared__ T n_star[3][3];
+    if (threadIdx.x == 0) {
+        invert_box_3x3(box, s_box_inv);
+    }
+    __syncthreads();
+    // n_star = (inv(box))^T in row-major: n_star[i][j] = inv[j][i] = s_box_inv[j*3+i]
     if (threadIdx.x < 9) {
         int i = threadIdx.x / 3;
         int j = threadIdx.x % 3;
-        n_star[i][j] = recip_vecs[i * 3 + j];
+        n_star[i][j] = s_box_inv[j * 3 + i];
     }
     __syncthreads();
 
@@ -183,7 +190,7 @@ template <typename T, int RANK>
 __global__ void interpolate_kernel(
     const T* __restrict__ grid,
     const T* __restrict__ coords,
-    const T* __restrict__ recip_vecs,
+    const T* __restrict__ box,
     const T* __restrict__ Q,
     T* __restrict__ phi_atoms,
     T* __restrict__ E_atoms,
@@ -193,11 +200,16 @@ __global__ void interpolate_kernel(
     int N_atoms,
     int K1, int K2, int K3
 ) {
+    __shared__ T s_box_inv[9];
     __shared__ T n_star[3][3];
+    if (threadIdx.x == 0) {
+        invert_box_3x3(box, s_box_inv);
+    }
+    __syncthreads();
     if (threadIdx.x < 9) {
         int i = threadIdx.x / 3;
         int j = threadIdx.x % 3;
-        n_star[i][j] = recip_vecs[i * 3 + j];
+        n_star[i][j] = s_box_inv[j * 3 + i];
     }
     __syncthreads();
 
@@ -433,14 +445,25 @@ __global__ void interpolate_kernel(
 template <typename T>
 __global__ void pme_convolution_fused_kernel(
     c10::complex<T>* __restrict__ grid_recip,
-    const T* __restrict__ d_recip,
+    const T* __restrict__ box,
     const T* __restrict__ xmoduli,
     const T* __restrict__ ymoduli,
     const T* __restrict__ zmoduli,
     int K1, int K2, int K3,
-    T alpha,
-    T V
+    T alpha
 ) {
+    __shared__ T s_box_inv[9];
+    __shared__ T d_recip[9];
+    __shared__ T s_volume;
+    if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+        invert_box_3x3(box, s_box_inv, &s_volume);
+        for (int k = 0; k < 9; k++) {
+            int i = k / 3, j = k % 3;
+            d_recip[k] = s_box_inv[j * 3 + i];
+        }
+    }
+    __syncthreads();
+
     int idx_x = blockIdx.x * blockDim.x + threadIdx.x;
     int idx_y = blockIdx.y * blockDim.y + threadIdx.y;
     int idx_z = blockIdx.z * blockDim.z + threadIdx.z;
@@ -459,7 +482,7 @@ __global__ void pme_convolution_fused_kernel(
     T ky = TWOPI * (mx * d_recip[1] + my * d_recip[4] + mz * d_recip[7]);
     T kz = TWOPI * (mx * d_recip[2] + my * d_recip[5] + mz * d_recip[8]);
     T ksq = kx*kx + ky*ky + kz*kz;
-    T C_k = ((T)2.0 * TWOPI / (V * ksq)) * exp(-ksq / ((T)4.0 * alpha * alpha));
+    T C_k = ((T)2.0 * TWOPI / (s_volume * ksq)) * exp(-ksq / ((T)4.0 * alpha * alpha));
     T theta_x = xmoduli[idx_x];
     T theta_y = ymoduli[idx_y];
     T theta_z = zmoduli[idx_z];
@@ -475,18 +498,18 @@ __global__ void pme_convolution_fused_kernel(
 // ============================================================================
 template <typename T, int RANK>
 void compute_pme_cuda_pipeline(
-    const at::Tensor& coords, const at::Tensor& Q, const at::Tensor& recip_vecs,
+    const at::Tensor& coords, const at::Tensor& Q, const at::Tensor& box,
     const at::Tensor& xmoduli, const at::Tensor& ymoduli, const at::Tensor& zmoduli,
     const at::Tensor& phi_atoms,
     const at::Tensor& E_atoms, const at::Tensor& EG_atoms,
     const at::Tensor& force_atoms,
-    T alpha, T volume, int K1, int K2, int K3
+    T alpha, int K1, int K2, int K3
 ) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     T* d_coords = coords.data_ptr<T>();
     T* d_Q      = Q.data_ptr<T>();
-    T* d_recip  = recip_vecs.data_ptr<T>();
+    T* d_box    = box.data_ptr<T>();
     T* d_xmoduli = xmoduli.data_ptr<T>();
     T* d_ymoduli = ymoduli.data_ptr<T>();
     T* d_zmoduli = zmoduli.data_ptr<T>();
@@ -504,7 +527,7 @@ void compute_pme_cuda_pipeline(
     constexpr int BLOCK_SIZE = 256;
     int GRID_SIZE = (N_atoms + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-    spread_q_kernel<T, RANK><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(d_coords, d_Q, d_recip, d_grid_real, N_atoms, K1, K2, K3);
+    spread_q_kernel<T, RANK><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(d_coords, d_Q, d_box, d_grid_real, N_atoms, K1, K2, K3);
 
     // 2. Forward FFT (real to complex)
     auto grid_recip = torch::fft::rfftn(grid_3d).contiguous();
@@ -512,14 +535,14 @@ void compute_pme_cuda_pipeline(
 
     dim3 dimBlock(8, 8, 8);
     dim3 dimGrid((K1+7)/8, (K2+7)/8, (K3_complex+7)/8);
-    pme_convolution_fused_kernel<T><<<dimGrid, dimBlock, 0, stream>>>(grid_recip_ptr, d_recip, d_xmoduli, d_ymoduli, d_zmoduli, K1, K2, K3, alpha, volume);
+    pme_convolution_fused_kernel<T><<<dimGrid, dimBlock, 0, stream>>>(grid_recip_ptr, d_box, d_xmoduli, d_ymoduli, d_zmoduli, K1, K2, K3, alpha);
 
     // 3. Inverse FFT (complex to real)
     auto grid_real = torch::fft::irfftn(grid_recip, {K1, K2, K3}, c10::nullopt, "forward");
     T* grid_real_ptr = grid_real.data_ptr<T>();
 
     // 4. Interpolate (AND FORCES)
-    interpolate_kernel<T, RANK><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(grid_real_ptr, d_coords, d_recip, d_Q, d_phi, d_E, d_EG, d_force, alpha, N_atoms, K1, K2, K3);
+    interpolate_kernel<T, RANK><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(grid_real_ptr, d_coords, d_box, d_Q, d_phi, d_E, d_EG, d_force, alpha, N_atoms, K1, K2, K3);
 
 }
 
@@ -568,7 +591,7 @@ static torch::autograd::variable_list forward(
     const int K1 = K, K2 = K, K3 = K;
 
     // --- 1. Setup Grid & Geometry ---
-    at::Tensor recip_vecs = torch::inverse(box).t().contiguous().to(coords.dtype());
+    at::Tensor box_contig = box.contiguous().to(coords.dtype());
     int N = coords.size(0);
 
     // --- 2. Prepare Multipole Tensor ---
@@ -590,13 +613,12 @@ static torch::autograd::variable_list forward(
     // --- 4. Run CUDA Pipeline (allocates its own grid internally) ---
     AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "pme_long_range_forward", ([&] {
         scalar_t alpha_val = static_cast<scalar_t>(alpha_t.toDouble());
-        scalar_t volume_val = static_cast<scalar_t>(torch::det(box).item<double>());
         if (rank == 0) {
-            compute_pme_cuda_pipeline<scalar_t, 0>(coords, Q_combined, recip_vecs, xmoduli, ymoduli, zmoduli, phi, E, EG, forces, alpha_val, volume_val, K1, K2, K3);
+            compute_pme_cuda_pipeline<scalar_t, 0>(coords, Q_combined, box_contig, xmoduli, ymoduli, zmoduli, phi, E, EG, forces, alpha_val, K1, K2, K3);
         } else if (rank == 1) {
-            compute_pme_cuda_pipeline<scalar_t, 1>(coords, Q_combined, recip_vecs, xmoduli, ymoduli, zmoduli, phi, E, EG, forces, alpha_val, volume_val, K1, K2, K3);
+            compute_pme_cuda_pipeline<scalar_t, 1>(coords, Q_combined, box_contig, xmoduli, ymoduli, zmoduli, phi, E, EG, forces, alpha_val, K1, K2, K3);
         } else {
-            compute_pme_cuda_pipeline<scalar_t, 2>(coords, Q_combined, recip_vecs, xmoduli, ymoduli, zmoduli, phi, E, EG, forces, alpha_val, volume_val, K1, K2, K3);
+            compute_pme_cuda_pipeline<scalar_t, 2>(coords, Q_combined, box_contig, xmoduli, ymoduli, zmoduli, phi, E, EG, forces, alpha_val, K1, K2, K3);
         }
 
         // --- 5. Apply Self-Corrections ---
