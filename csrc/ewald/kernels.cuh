@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 #include "common/vec3.cuh"
 #include "common/constants.cuh"
+#include "common/pbc.cuh"
 #include "self_contribution.cuh"
 #include "smem.cuh"
 
@@ -12,16 +13,16 @@
 template <typename T>
 __global__ void prepare_k_constants_kernel(
     int64_t kmax, T alpha,
-    const T* __restrict__ box_inv, // (3,3)
+    const T* __restrict__ box, // (3,3)
     T* __restrict__ kvecs         // (4,M1) out (kx,ky,kz,weight)
 )
 {
     __shared__ T recip[9];
 
-    if (threadIdx.x < 9) {
-        recip[threadIdx.x] = box_inv[threadIdx.x];
+    if (threadIdx.x == 0) {
+        // Compute reciprocal box matrix once per block
+        invert_box_3x3(box, recip);
     }
-
     __syncthreads();
 
     const int64_t L = 2 * kmax + 1;
@@ -76,7 +77,7 @@ __global__ void ewald_forward_kernel(
     const T* __restrict__ p,                   // (N, 3) or null
     const T* __restrict__ t,                   // (N, 9) or null
     int64_t M, int64_t N,
-    T V,
+    const T* __restrict__ box,                 // (3,3)
     T* __restrict__ Sreal,                     // (M) Out
     T* __restrict__ Simag,                     // (M) Out
     T* __restrict__ energy                       // (1) Out
@@ -89,6 +90,15 @@ __global__ void ewald_forward_kernel(
         "BLOCK_SIZE must be <= 1024 for CUDA thread blocks.");
     static_assert(RANK >= 0 && RANK <= 2,
         "RANK must be 0, 1, or 2.");
+
+    // Compute box volume once per block
+    __shared__ T s_volume;
+    if (threadIdx.x == 0) {
+        T tmp_inv[9];
+        invert_box_3x3(box, tmp_inv, &s_volume);
+    }
+    __syncthreads();
+    const T V = s_volume;
 
     const int k = blockIdx.x; // One block per k-vector
 
@@ -574,7 +584,7 @@ __global__ void ewald_backward_kernel(
     const T* __restrict__ q,                      // (N)
     const T* __restrict__ p,                      // (N,3)
     const T* __restrict__ Q,                      // (N,9)
-    int64_t M, int64_t N, T V, T alpha,
+    int64_t M, int64_t N, const T* __restrict__ box, T alpha,
     T* __restrict__ epot_out,                      // (N)
     T* __restrict__ efield_out,                    // (N,3)
     T* __restrict__ efield_grad_out,                     // (N,9)
@@ -589,6 +599,15 @@ __global__ void ewald_backward_kernel(
         "BLOCK_SIZE must be <= 1024 for CUDA thread blocks.");
     static_assert(RANK >= 0 && RANK <= 2,
         "RANK must be 0, 1, or 2.");
+
+    // Compute box volume once per block
+    __shared__ T s_volume;
+    if (threadIdx.x == 0) {
+        T tmp_inv[9];
+        invert_box_3x3(box, tmp_inv, &s_volume);
+    }
+    __syncthreads();
+    const T V = s_volume;
 
     constexpr int NUM_WARPS = BLOCK_SIZE >> 5;
     __shared__ Smem<T, RANK, NUM_WARPS> smem;
@@ -674,7 +693,7 @@ __global__ void ewald_fourier_gradient_kernel(
     const T* __restrict__ coords,
     const T* __restrict__ pot_grad,
     const T* __restrict__ field_grad,
-    int64_t M, int64_t N, T boxV,
+    int64_t M, int64_t N, const T* __restrict__ box,
     T* __restrict__ Fdr, T* __restrict__ Fdi 
 )                    
 {
@@ -685,6 +704,15 @@ __global__ void ewald_fourier_gradient_kernel(
         "BLOCK_SIZE must be <= 1024 for CUDA thread blocks.");
     static_assert(RANK >= 0 && RANK <= 2,
         "RANK must be 0, 1, or 2.");
+
+    // Compute box volume once per block
+    __shared__ T s_volume;
+    if (threadIdx.x == 0) {
+        T tmp_inv[9];
+        invert_box_3x3(box, tmp_inv, &s_volume);
+    }
+    __syncthreads();
+    const T boxV = s_volume;
 
     const int k = blockIdx.x; // One block per k-vector
 
@@ -771,7 +799,7 @@ __global__ void ewald_backward_with_fields_kernel(
     const T* __restrict__ dE,
     const T* __restrict__ Sreal,
     const T* __restrict__ Simag,
-    int64_t M, T alpha, T V,
+    int64_t M, T alpha, const T* __restrict__ box,
     T* __restrict__ coords_grad_out,
     T* __restrict__ q_grad_out,                      // (N)
     T* __restrict__ p_grad_out,                    // (N,3)
@@ -790,6 +818,15 @@ __global__ void ewald_backward_with_fields_kernel(
     constexpr T TWOPI = two_pi<T>();
     constexpr T TWOPI2O3 = TWOPI * TWOPI / T(3.0);
     constexpr int NUM_WARPS = BLOCK_SIZE >> 5;
+
+    // Compute box volume once per block
+    __shared__ T s_volume;
+    if (threadIdx.x == 0) {
+        T tmp_inv[9];
+        invert_box_3x3(box, tmp_inv, &s_volume);
+    }
+    __syncthreads();
+    const T V = s_volume;
 
     const int64_t i = blockIdx.x;
     

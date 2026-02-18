@@ -1,155 +1,177 @@
 import numpy as np
-from typing import Optional
-from scipy.spatial.distance import cdist
 import pytest
-from .utils import perf_op, check_op
-from .get_reference import get_water_data
-
 import torch
-from torchff.multipoles import compute_multipolar_energy_from_atom_pairs
+
+from .utils import check_op, perf_op
+from torchff.multipoles import MultipolarInteraction
 
 
-def computeInteractionTensor(drVec: torch.Tensor, dampFactors: torch.Tensor, drInv: Optional[torch.Tensor] = None, rank: int = 2):
-    """
-    drVec: N x 3
-    mPoles: N x 10
-    dampFactors: 5 x N
-
-    eData: N x 
-    """
-    if drInv is None:
-        drInv = 1 / torch.norm(drVec, dim=1)
-    
-    # calculate inversions
-    drInv2 = torch.pow(drInv, 2)
-    drInv3 = drInv2 * drInv
-    drInv5 = drInv3 * drInv2
-
-    drVec2 = torch.pow(drVec, 2)
-    x, y, z = drVec[:, 0], drVec[:, 1], drVec[:, 2]
-    x2, y2, z2 = drVec2[:, 0], drVec2[:, 1], drVec2[:, 2]
-    xy, xz, yz = x * y, x * z, y * z
-
-    drInv7 = drInv5 * drInv2
-    drInv9 = drInv7 * drInv2
-
-    if len(dampFactors):
-        drInv = drInv * dampFactors[0]
-        if rank > 0:
-            drInv3 = drInv3 * dampFactors[1]
-            drInv5 = drInv5 * dampFactors[2]
-        if rank > 1:
-            drInv7 = drInv7 * dampFactors[3]
-            drInv9 = drInv9 * dampFactors[4]
-
-    tx, ty, tz = -x * drInv3, -y * drInv3, -z * drInv3
-    
-    txx = 3 * x2 * drInv5 - drInv3
-    txy = 3 * xy * drInv5
-    txz = 3 * xz * drInv5
-    tyy = 3 * y2 * drInv5 - drInv3
-    tyz = 3 * yz * drInv5
-    tzz = 3 * z2 * drInv5 - drInv3     
-
-    txxx = -15 * x2 * x * drInv7 + 9 * x * drInv5
-    txxy = -15 * x2 * y * drInv7 + 3 * y * drInv5
-    txxz = -15 * x2 * z * drInv7 + 3 * z * drInv5
-    tyyy = -15 * y2 * y * drInv7 + 9 * y * drInv5
-    tyyx = -15 * y2 * x * drInv7 + 3 * x * drInv5
-    tyyz = -15 * y2 * z * drInv7 + 3 * z * drInv5
-    tzzz = -15 * z2 * z * drInv7 + 9 * z * drInv5
-    tzzx = -15 * z2 * x * drInv7 + 3 * x * drInv5
-    tzzy = -15 * z2 * y * drInv7 + 3 * y * drInv5
-    txyz = -15 * x * y * z * drInv7
-
-    txxxx = 105 * x2 * x2 * drInv9 - 90 * x2 * drInv7 + 9 * drInv5
-    txxxy = 105 * x2 * xy * drInv9 - 45 * xy * drInv7
-    txxxz = 105 * x2 * xz * drInv9 - 45 * xz * drInv7
-    txxyy = 105 * x2 * y2 * drInv9 - 15 * (x2 + y2) * drInv7 + 3 * drInv5
-    txxzz = 105 * x2 * z2 * drInv9 - 15 * (x2 + z2) * drInv7 + 3 * drInv5
-    txxyz = 105 * x2 * yz * drInv9 - 15 * yz * drInv7
-
-    tyyyy = 105 * y2 * y2 * drInv9 - 90 * y2 * drInv7 + 9 * drInv5
-    tyyyx = 105 * y2 * xy * drInv9 - 45 * xy * drInv7
-    tyyyz = 105 * y2 * yz * drInv9 - 45 * yz * drInv7
-    tyyzz = 105 * y2 * z2 * drInv9 - 15 * (y2 + z2) * drInv7 + 3 * drInv5
-    tyyxz = 105 * y2 * xz * drInv9 - 15 * xz * drInv7
-
-    tzzzz = 105 * z2 * z2 * drInv9 - 90 * z2 * drInv7 + 9 * drInv5
-    tzzzx = 105 * z2 * xz * drInv9 - 45 * xz * drInv7
-    tzzzy = 105 * z2 * yz * drInv9 - 45 * yz * drInv7                
-    tzzxy = 105 * z2 * xy * drInv9 - 15 * xy * drInv7
-
-    
-    if rank == 0:
-        iTensor = drInv
-    elif rank == 1:
-        iTensor = torch.vstack((
-            drInv, -tx,   -ty,   -tz,   
-            tx,    -txx,  -txy,  -txz,  
-            ty,    -txy,  -tyy,  -tyz,  
-            tz,    -txz,  -tyz,  -tzz,  
-        )).T.reshape(-1, 4, 4)
-    elif rank == 2:
-        iTensor = torch.vstack((
-            drInv, -tx,   -ty,   -tz,   txx,   txy,   txz,   tyy,   tyz,   tzz,
-            tx,    -txx,  -txy,  -txz,  txxx,  txxy,  txxz,  tyyx,  txyz,  tzzx,
-            ty,    -txy,  -tyy,  -tyz,  txxy,  tyyx,  txyz,  tyyy,  tyyz,  tzzy,
-            tz,    -txz,  -tyz,  -tzz,  txxz,  txyz,  tzzx,  tyyz,  tzzy,  tzzz,
-            txx,   -txxx, -txxy, -txxz, txxxx, txxxy, txxxz, txxyy, txxyz, txxzz,
-            txy,   -txxy, -tyyx, -txyz, txxxy, txxyy, txxyz, tyyyx, tyyxz, tzzxy,
-            txz,   -txxz, -txyz, -tzzx, txxxz, txxyz, txxzz, tyyxz, tzzxy, tzzzx,
-            tyy,   -tyyx, -tyyy, -tyyz, txxyy, tyyyx, tyyxz, tyyyy, tyyyz, tyyzz,
-            tyz,   -txyz, -tyyz, -tzzy, txxyz, tyyxz, tzzxy, tyyyz, tyyzz, tzzzy,
-            tzz,   -tzzx, -tzzy, -tzzz, txxzz, tzzxy, tzzzx, tyyzz, tzzzy, tzzzz
-        )).T.reshape(-1, 10, 10)
-    else:
-        raise NotImplementedError(f"Rank >= {rank} not supported")
-    
-    return iTensor
+torch.set_printoptions(precision=8)
 
 
-@torch.compile
-def compute_multipolar_energy_ref(coords: torch.Tensor, pairs: torch.Tensor, multipoles: torch.Tensor):
-    drVecs = coords[pairs[:, 1]] - coords[pairs[:, 0]]
-    drInv = 1 / torch.norm(drVecs, dim=1)
-    iTensor = computeInteractionTensor(drVecs, [], drInv, 2)
-    mPoles_j_p = multipoles[pairs[:, 1]]
-    mPoles_i_p = multipoles[pairs[:, 0]]
-    ene = torch.sum(torch.bmm(mPoles_j_p.unsqueeze(1), torch.bmm(iTensor, mPoles_i_p.unsqueeze(2))))
-    return ene
+def create_test_data(
+    num: int,
+    rank: int = 2,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.float64,
+    cutoff: float = 9.0,
+    ewald_alpha: float = -1.0,
+):
+    """Create random test data for multipolar interaction tests."""
+    box_len = float((num * 10.0) ** (1.0 / 3.0))
 
+    coords_np = np.random.rand(num, 3) * box_len
+    q_np = np.random.randn(num) * 0.1
+    d_np = np.random.randn(num, 3) * 0.1
 
-@pytest.mark.parametrize("device, dtype", [
-    # ('cpu', torch.float64), 
-    # ('cpu', torch.float32), 
-    # ('cuda', torch.float32),
-    ('cuda', torch.float64), 
-])
-def test_multipolar(device, dtype):
-    coords_numpy = get_water_data(100, 0.5).coords.numpy(force=True) * 10 # in atomic units
-    dist_mat = cdist(coords_numpy, coords_numpy) 
-    dist_mat[np.triu_indices(coords_numpy.shape[0])] = np.inf
-    pairs = np.argwhere(dist_mat < 9.0).tolist()
-    print("Num pairs:", len(pairs))
+    t_np = np.empty((num, 3, 3), dtype=float)
+    for i in range(num):
+        A = np.random.randn(3, 3)
+        sym = 0.5 * (A + A.T)
+        trace = np.trace(sym) / 3.0
+        sym -= np.eye(3) * trace
+        t_np[i] = sym
 
-    coords = torch.tensor(coords_numpy.tolist(), dtype=dtype, device=device, requires_grad=True)
-    pairs = torch.tensor(pairs, dtype=torch.int32)
+    box_np = np.eye(3) * box_len
 
-    mutlipoles_numpy = np.random.rand(coords.shape[0], 10) * 10
-    multipoles = torch.tensor(mutlipoles_numpy.tolist(), device=device, dtype=dtype, requires_grad=True)
+    # PBC minimum-image distance to build pairs
+    dr = coords_np[:, None, :] - coords_np[None, :, :]
+    box_inv_np = np.linalg.inv(box_np)
+    ds = dr @ box_inv_np
+    ds = ds - np.floor(ds + 0.5)
+    dr_pbc = ds @ box_np
+    dist = np.linalg.norm(dr_pbc, axis=2)
+    ii, jj = np.triu_indices(num, k=1)
+    mask = dist[ii, jj] < cutoff
+    pairs_np = np.column_stack([ii[mask], jj[mask]])
 
-    # perf_op(
-    #     compute_multipolar_energy_ref, coords, pairs, multipoles, desc='ref', run_backward=True
-    # )
-    # perf_op(
-    #     compute_multipolar_energy_from_atom_pairs, coords, pairs, multipoles, desc='torchff', run_backward=True
-    # )
+    if pairs_np.size == 0:
+        pairs_np = np.array([[0, 1]], dtype=np.int64)
 
-    check_op(
-        compute_multipolar_energy_from_atom_pairs,
-        compute_multipolar_energy_ref,
-        coords, pairs, multipoles,
-        check_grad=True
+    coords = torch.tensor(coords_np, device=device, dtype=dtype, requires_grad=True)
+    box = torch.tensor(box_np, device=device, dtype=dtype)
+    pairs = torch.tensor(pairs_np, device=device, dtype=torch.int64)
+    q = torch.tensor(q_np, device=device, dtype=dtype, requires_grad=True)
+    p = (
+        torch.tensor(d_np, device=device, dtype=dtype, requires_grad=True)
+        if rank >= 1
+        else None
+    )
+    t = (
+        torch.tensor(t_np, device=device, dtype=dtype, requires_grad=True)
+        if rank >= 2
+        else None
     )
 
+    prefactor = 1.0
+    return coords, box, pairs, q, p, t, cutoff, ewald_alpha, prefactor
+
+
+@pytest.mark.dependency()
+@pytest.mark.parametrize("device, dtype", [("cuda", torch.float32), ("cuda", torch.float64)])
+@pytest.mark.parametrize("rank", [0, 1, 2])
+def test_multipolar_energy(device, dtype, rank):
+    """Compare custom CUDA multipolar kernel against Python reference implementation."""
+    N = 200
+    coords, box, pairs, q, p, t, cutoff, ewald_alpha, prefactor = create_test_data(
+        N, rank, device=device, dtype=dtype
+    )
+
+    func = MultipolarInteraction(
+        rank, cutoff, ewald_alpha, prefactor, use_customized_ops=True
+    ).to(device=device, dtype=dtype)
+    func_ref = MultipolarInteraction(
+        rank, cutoff, ewald_alpha, prefactor, use_customized_ops=False, cuda_graph_compat=False
+    ).to(device=device, dtype=dtype)
+
+    # rank=2 sums many pair energies; CUDA parallel reduction order can differ from Python
+    # sequential sum, so allow slightly larger tolerance for quadrupoles
+    atol = 1e-6 if dtype is torch.float64 else 1e-4
+    rtol = 0.0
+    if rank == 2:
+        atol = max(atol, 1e-2)
+        rtol = 1e-4
+    check_op(
+        func,
+        func_ref,
+        {"coords": coords, "box": box, "pairs": pairs, "q": q, "p": p, "t": t},
+        check_grad=True,
+        atol=atol,
+        rtol=rtol,
+    )
+
+
+@pytest.mark.parametrize("device, dtype", [("cuda", torch.float32), ("cuda", torch.float64)])
+@pytest.mark.parametrize("rank", [0, 1, 2])
+def test_perf_multipolar(device, dtype, rank):
+    """Performance comparison between Python and custom CUDA multipolar implementations."""
+    N = 500
+    coords, box, pairs, q, p, t, cutoff, ewald_alpha, prefactor = create_test_data(
+        N, rank, device=device, dtype=dtype
+    )
+
+    func_ref = torch.compile(
+        MultipolarInteraction(
+            rank, cutoff, ewald_alpha, prefactor,
+            use_customized_ops=False, cuda_graph_compat=False,
+        )
+    ).to(device=device, dtype=dtype)
+    func = MultipolarInteraction(
+        rank, cutoff, ewald_alpha, prefactor, use_customized_ops=True
+    ).to(device=device, dtype=dtype)
+
+    perf_op(
+        func_ref,
+        coords,
+        box,
+        pairs,
+        q,
+        p,
+        t,
+        desc=f"multipolar_ref (N={N}, rank={rank})",
+        repeat=1000,
+        run_backward=True,
+    )
+    perf_op(
+        func,
+        coords,
+        box,
+        pairs,
+        q,
+        p,
+        t,
+        desc=f"multipolar_torchff (N={N}, rank={rank})",
+        repeat=1000,
+        run_backward=True,
+    )
+
+
+@pytest.mark.dependency()
+@pytest.mark.parametrize("device, dtype", [("cuda", torch.float32), ("cuda", torch.float64)])
+@pytest.mark.parametrize("rank", [0, 1, 2])
+def test_multipolar_energy_ewald(device, dtype, rank):
+    """Compare custom CUDA vs Python reference when ewald_alpha > 0 (erfc damping)."""
+    N = 200
+    coords, box, pairs, q, p, t, cutoff, ewald_alpha, prefactor = create_test_data(
+        N, rank, device=device, dtype=dtype, ewald_alpha=0.4
+    )
+
+    func = MultipolarInteraction(
+        rank, cutoff, ewald_alpha, prefactor, use_customized_ops=True
+    ).to(device=device, dtype=dtype)
+    func_ref = MultipolarInteraction(
+        rank, cutoff, ewald_alpha, prefactor, use_customized_ops=False, cuda_graph_compat=False
+    ).to(device=device, dtype=dtype)
+
+    atol = 1e-5 if dtype is torch.float64 else 1e-3
+    rtol = 1e-4
+    if rank == 2:
+        atol = max(atol, 1e-2)
+    check_op(
+        func,
+        func_ref,
+        {"coords": coords, "box": box, "pairs": pairs, "q": q, "p": p, "t": t},
+        check_grad=True,
+        atol=atol,
+        rtol=rtol,
+    )

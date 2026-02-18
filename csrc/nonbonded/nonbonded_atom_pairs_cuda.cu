@@ -18,7 +18,6 @@ __global__ void nonbonded_atom_pairs_cuda_kernel(
     scalar_t* coords,
     int64_t* pairs,
     scalar_t* g_box,
-    scalar_t* g_box_inv,
     scalar_t* sigma, 
     scalar_t* epsilon,
     scalar_t* charges,
@@ -37,7 +36,12 @@ __global__ void nonbonded_atom_pairs_cuda_kernel(
     __shared__ scalar_t box_inv[9];
     if (threadIdx.x < 9) {
         box[threadIdx.x] = g_box[threadIdx.x];
-        box_inv[threadIdx.x] = g_box_inv[threadIdx.x];
+    }
+    __syncthreads();
+
+    // Invert box inside the kernel using first thread
+    if (threadIdx.x == 0) {
+        invert_box_3x3(box, box_inv);
     }
     __syncthreads();
 
@@ -152,10 +156,6 @@ public:
         bool do_shift
     )
     {
-        // at::linalg_inv does not support CUDA graph
-        at::Tensor box_inv, ignore;
-        std::tie(box_inv, ignore) = at::linalg_inv_ex(box, false);
-
         int64_t npairs = pairs.size(0);
 
         at::Tensor ene = at::zeros({1}, coords.options());
@@ -181,7 +181,6 @@ public:
                     coords.data_ptr<scalar_t>(),
                     pairs.data_ptr<int64_t>(),
                     box.data_ptr<scalar_t>(),
-                    box_inv.data_ptr<scalar_t>(),
                     sigma.data_ptr<scalar_t>(),
                     epsilon.data_ptr<scalar_t>(),
                     charges.data_ptr<scalar_t>(),
@@ -199,7 +198,6 @@ public:
                     coords.data_ptr<scalar_t>(),
                     pairs.data_ptr<int64_t>(),
                     box.data_ptr<scalar_t>(),
-                    box_inv.data_ptr<scalar_t>(),
                     sigma.data_ptr<scalar_t>(),
                     epsilon.data_ptr<scalar_t>(),
                     charges.data_ptr<scalar_t>(),
@@ -274,10 +272,6 @@ void compute_nonbonded_forces_from_atom_pairs_cuda(
     at::Tensor forces
 )
 {
-    // at::linalg_inv does not support CUDA graph
-    at::Tensor box_inv, ignore;
-    std::tie(box_inv, ignore) = at::linalg_inv_ex(box, false);
-
     auto props = at::cuda::getCurrentDeviceProperties();
     auto stream = at::cuda::getCurrentCUDAStream();
     int64_t npairs = pairs.size(0);
@@ -295,7 +289,6 @@ void compute_nonbonded_forces_from_atom_pairs_cuda(
             coords.data_ptr<scalar_t>(),
             pairs.data_ptr<int64_t>(),
             box.data_ptr<scalar_t>(),
-            box_inv.data_ptr<scalar_t>(),
             sigma.data_ptr<scalar_t>(),
             epsilon.data_ptr<scalar_t>(),
             charges.data_ptr<scalar_t>(),

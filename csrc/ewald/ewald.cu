@@ -38,7 +38,6 @@ static at::Tensor forward(
     } else if (p.has_value()) {
         rank = 1;
     }
-    const double Vd = at::det(box).item<double>();
 
     // Prepare output tensors
     const int64_t M = K * ( K * (4*K+6) + 3 );
@@ -54,23 +53,18 @@ static at::Tensor forward(
     ctx->saved_data["rank"] = rank;
     ctx->saved_data["alpha"] = alpha;
     ctx->saved_data["K"] = K;
-    ctx->saved_data["Vd"] = Vd;
     ctx->saved_data["N"] = N;
     ctx->saved_data["M"] = M;
 
-    // Reciprocal lattice vectors and box volume
-    at::Tensor recip = at::linalg_inv(box);
-
     AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "ewald_forward", ([&] {
         const scalar_t alpha_val = static_cast<scalar_t>(alpha.toDouble());
-        const scalar_t V = static_cast<scalar_t>(Vd);
 
         // 1. Prepare k-vectors
         constexpr int BLOCK_SIZE_KVECS = 256;
         const int GRID_SIZE_KVECS = (M + BLOCK_SIZE_KVECS - 1) / BLOCK_SIZE_KVECS;
         prepare_k_constants_kernel<scalar_t><<<GRID_SIZE_KVECS, BLOCK_SIZE_KVECS, 0, stream>>>(
             K, alpha_val,
-            recip.data_ptr<scalar_t>(),
+            box.data_ptr<scalar_t>(),
             kvec.data_ptr<scalar_t>()
         );
 
@@ -89,7 +83,7 @@ static at::Tensor forward(
                 q.data_ptr<scalar_t>(),
                 nullptr,
                 nullptr,
-                M, N, V,
+                M, N, box.data_ptr<scalar_t>(),
                 Sreal.data_ptr<scalar_t>(),
                 Simag.data_ptr<scalar_t>(),
                 energy.data_ptr<scalar_t>()
@@ -108,7 +102,7 @@ static at::Tensor forward(
                 q.data_ptr<scalar_t>(),
                 p->data_ptr<scalar_t>(),
                 nullptr,
-                M, N, V,
+                M, N, box.data_ptr<scalar_t>(),
                 Sreal.data_ptr<scalar_t>(),
                 Simag.data_ptr<scalar_t>(),
                 energy.data_ptr<scalar_t>()
@@ -128,7 +122,7 @@ static at::Tensor forward(
                 q.data_ptr<scalar_t>(),
                 p->data_ptr<scalar_t>(),
                 t->data_ptr<scalar_t>(),
-                M, N, V,
+                M, N, box.data_ptr<scalar_t>(),
                 Sreal.data_ptr<scalar_t>(),
                 Simag.data_ptr<scalar_t>(),
                 energy.data_ptr<scalar_t>()
@@ -169,7 +163,6 @@ static torch::autograd::variable_list backward(
     at::Tensor grad_energy = grad_outputs[0];
 
     int64_t rank = ctx->saved_data["rank"].toInt();
-    int64_t K = ctx->saved_data["K"].toInt();
     int64_t N = ctx->saved_data["N"].toInt();
     int64_t M = ctx->saved_data["M"].toInt();
 
@@ -179,7 +172,6 @@ static torch::autograd::variable_list backward(
 
     AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "ewald_backward", ([&] {
         scalar_t alpha = static_cast<scalar_t>(ctx->saved_data["alpha"].toDouble());
-        scalar_t V = static_cast<scalar_t>(ctx->saved_data["Vd"].toDouble());
         constexpr int BLOCK_SIZE = 256;
         const int GRID_SIZE_BWD = N;
 
@@ -196,7 +188,7 @@ static torch::autograd::variable_list backward(
                 q.data_ptr<scalar_t>(),
                 nullptr,
                 nullptr,
-                M, N, V, alpha,
+                M, N, box.data_ptr<scalar_t>(), alpha,
                 pot.data_ptr<scalar_t>(),
                 field.data_ptr<scalar_t>(),
                 field_grad.data_ptr<scalar_t>(),
@@ -211,7 +203,7 @@ static torch::autograd::variable_list backward(
                 q.data_ptr<scalar_t>(),
                 p_ptr,
                 nullptr,
-                M, N, V, alpha,
+                M, N, box.data_ptr<scalar_t>(), alpha,
                 pot.data_ptr<scalar_t>(),
                 field.data_ptr<scalar_t>(),
                 field_grad.data_ptr<scalar_t>(),
@@ -226,7 +218,7 @@ static torch::autograd::variable_list backward(
                 q.data_ptr<scalar_t>(),
                 p_ptr,
                 t_ptr,
-                M, N, V, alpha,
+                M, N, box.data_ptr<scalar_t>(), alpha,
                 pot.data_ptr<scalar_t>(),
                 field.data_ptr<scalar_t>(),
                 field_grad.data_ptr<scalar_t>(),
@@ -310,7 +302,6 @@ static torch::autograd::variable_list forward(
     } else if (p.has_value()) {
         rank = 1;
     }
-    const double Vd = at::det(box).item<double>();
 
     // Prepare output tensors
     const int64_t M = K * ( K * (4*K+6) + 3 );
@@ -326,23 +317,18 @@ static torch::autograd::variable_list forward(
     ctx->saved_data["rank"] = rank;
     ctx->saved_data["alpha"] = alpha;
     ctx->saved_data["K"] = K;
-    ctx->saved_data["Vd"] = Vd;
     ctx->saved_data["N"] = N;
     ctx->saved_data["M"] = M;
 
-    // Reciprocal lattice vectors and box volume
-    at::Tensor recip = at::linalg_inv(box);
-
     AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "ewald_forward", ([&] {
         const scalar_t alpha_val = static_cast<scalar_t>(alpha.toDouble());
-        const scalar_t V = static_cast<scalar_t>(Vd);
 
         // 1. Prepare k-vectors
         constexpr int BLOCK_SIZE_KVECS = 256;
         const int GRID_SIZE_KVECS = (M + BLOCK_SIZE_KVECS - 1) / BLOCK_SIZE_KVECS;
         prepare_k_constants_kernel<scalar_t><<<GRID_SIZE_KVECS, BLOCK_SIZE_KVECS, 0, stream>>>(
             K, alpha_val,
-            recip.data_ptr<scalar_t>(),
+            box.data_ptr<scalar_t>(),
             kvec.data_ptr<scalar_t>()
         );
 
@@ -362,7 +348,7 @@ static torch::autograd::variable_list forward(
                 q.data_ptr<scalar_t>(),
                 nullptr,
                 nullptr,
-                M, N, V,
+                M, N, box.data_ptr<scalar_t>(),
                 Sreal.data_ptr<scalar_t>(),
                 Simag.data_ptr<scalar_t>(),
                 energy.data_ptr<scalar_t>()
@@ -375,7 +361,7 @@ static torch::autograd::variable_list forward(
                 q.data_ptr<scalar_t>(),
                 nullptr,
                 nullptr,
-                M, N, V, alpha_val,
+                M, N, box.data_ptr<scalar_t>(), alpha_val,
                 pot.data_ptr<scalar_t>(),
                 field.data_ptr<scalar_t>(),
                 field_grad.data_ptr<scalar_t>(),
@@ -395,7 +381,7 @@ static torch::autograd::variable_list forward(
                 q.data_ptr<scalar_t>(),
                 p->data_ptr<scalar_t>(),
                 nullptr,
-                M, N, V,
+                M, N, box.data_ptr<scalar_t>(),
                 Sreal.data_ptr<scalar_t>(),
                 Simag.data_ptr<scalar_t>(),
                 energy.data_ptr<scalar_t>()
@@ -408,7 +394,7 @@ static torch::autograd::variable_list forward(
                 q.data_ptr<scalar_t>(),
                 p->data_ptr<scalar_t>(),
                 nullptr,
-                M, N, V, alpha_val,
+                M, N, box.data_ptr<scalar_t>(), alpha_val,
                 pot.data_ptr<scalar_t>(),
                 field.data_ptr<scalar_t>(),
                 field_grad.data_ptr<scalar_t>(),
@@ -429,7 +415,7 @@ static torch::autograd::variable_list forward(
                 q.data_ptr<scalar_t>(),
                 p->data_ptr<scalar_t>(),
                 t->data_ptr<scalar_t>(),
-                M, N, V,
+                M, N, box.data_ptr<scalar_t>(),
                 Sreal.data_ptr<scalar_t>(),
                 Simag.data_ptr<scalar_t>(),
                 energy.data_ptr<scalar_t>()
@@ -442,7 +428,7 @@ static torch::autograd::variable_list forward(
                 q.data_ptr<scalar_t>(),
                 p->data_ptr<scalar_t>(),
                 t->data_ptr<scalar_t>(),
-                M, N, V, alpha_val,
+                M, N, box.data_ptr<scalar_t>(), alpha_val,
                 pot.data_ptr<scalar_t>(),
                 field.data_ptr<scalar_t>(),
                 field_grad.data_ptr<scalar_t>(),
@@ -526,7 +512,6 @@ static torch::autograd::variable_list backward(
     
     AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "ewald_backward_2", ([&] {
         scalar_t alpha = static_cast<scalar_t>(ctx->saved_data["alpha"].toDouble());
-        scalar_t V = static_cast<scalar_t>(ctx->saved_data["Vd"].toDouble());
         constexpr int BLOCK_SIZE = 256;
 
         if ( rank == 2 ) {
@@ -535,7 +520,7 @@ static torch::autograd::variable_list backward(
                 coords.data_ptr<scalar_t>(),
                 grad_pot.data_ptr<scalar_t>(),
                 grad_field.data_ptr<scalar_t>(),
-                M, N, V,
+                M, N, box.data_ptr<scalar_t>(),
                 Fdr.data_ptr<scalar_t>(), Fdi.data_ptr<scalar_t>()
             );
             ewald_backward_with_fields_kernel<scalar_t, 2, BLOCK_SIZE><<<N, BLOCK_SIZE, 0, stream>>>(
@@ -546,7 +531,7 @@ static torch::autograd::variable_list backward(
                 grad_pot.data_ptr<scalar_t>(),
                 grad_field.data_ptr<scalar_t>(),
                 Sreal.data_ptr<scalar_t>(), Simag.data_ptr<scalar_t>(),
-                M, alpha, V,
+                M, alpha, box.data_ptr<scalar_t>(),
                 coords_grad.data_ptr<scalar_t>(),
                 q_grad.data_ptr<scalar_t>(), p_grad.data_ptr<scalar_t>(), t_grad.data_ptr<scalar_t>()
             );
@@ -559,7 +544,7 @@ static torch::autograd::variable_list backward(
                 coords.data_ptr<scalar_t>(),
                 grad_pot.data_ptr<scalar_t>(),
                 grad_field.data_ptr<scalar_t>(),
-                M, N, V,
+                M, N, box.data_ptr<scalar_t>(),
                 Fdr.data_ptr<scalar_t>(), Fdi.data_ptr<scalar_t>()
             );
             ewald_backward_with_fields_kernel<scalar_t, 1, BLOCK_SIZE><<<N, BLOCK_SIZE, 0, stream>>>(
@@ -572,7 +557,7 @@ static torch::autograd::variable_list backward(
                 grad_field.data_ptr<scalar_t>(),
                 Sreal.data_ptr<scalar_t>(),
                 Simag.data_ptr<scalar_t>(),
-                M, alpha, V,
+                M, alpha, box.data_ptr<scalar_t>(),
                 coords_grad.data_ptr<scalar_t>(),
                 q_grad.data_ptr<scalar_t>(), p_grad.data_ptr<scalar_t>(), nullptr
             );
@@ -583,7 +568,7 @@ static torch::autograd::variable_list backward(
                 coords.data_ptr<scalar_t>(),
                 grad_pot.data_ptr<scalar_t>(),
                 grad_field.data_ptr<scalar_t>(),
-                M, N, V,
+                M, N, box.data_ptr<scalar_t>(),
                 Fdr.data_ptr<scalar_t>(), Fdi.data_ptr<scalar_t>()
             );
             ewald_backward_with_fields_kernel<scalar_t, 0, BLOCK_SIZE><<<N, BLOCK_SIZE, 0, stream>>>(
@@ -595,7 +580,7 @@ static torch::autograd::variable_list backward(
                 grad_field.data_ptr<scalar_t>(),
                 Sreal.data_ptr<scalar_t>(),
                 Simag.data_ptr<scalar_t>(),
-                M, alpha, V,
+                M, alpha, box.data_ptr<scalar_t>(),
                 coords_grad.data_ptr<scalar_t>(),
                 q_grad.data_ptr<scalar_t>(), nullptr, nullptr
             );

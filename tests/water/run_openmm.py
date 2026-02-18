@@ -57,27 +57,58 @@ def run_openmm_water_md(
     steps: int = 100_000,
     platform: str | None = None,
     temperature: float = 300.0,
+    use_pme: bool = True,
+    alpha: float | None = None,
+    kmax: int | None = None,
 ) -> tuple[float, float, int]:
     """Run a short NVE water simulation and return (ms/step, alpha, kmax).
 
     This is a programmatic entry point that mirrors the CLI behaviour of this
     script.  It is intended to be re-used by benchmarks such as
     ``examples/fixed_charge_benchmark.py``.
+
+    Parameters
+    ----------
+    pdb : str
+        Path to the water PDB file.
+    steps : int
+        Number of MD steps to run.
+    platform : str | None
+        OpenMM platform (e.g. CUDA, CPU). If None, auto-select.
+    temperature : float
+        Initial temperature in Kelvin for velocity initialization.
+    use_pme : bool
+        If True, use PME instead of Ewald for long-range electrostatics.
+    alpha : float | None
+        PME separation parameter in 1/nm. If provided with kmax, overrides
+        OpenMM defaults to match TorchFF.
+    kmax : int | None
+        PME reciprocal-space grid size (max of nx, ny, nz). If provided with
+        alpha, overrides OpenMM defaults to match TorchFF.
     """
     # Load the PDB (assumed to be a pure water box)
     pdb_file = app.PDBFile(pdb)
 
-    # Flexible TIP3P with PME (8 Å cutoff), no constraints.
+    # Flexible TIP3P (8 A cutoff), no constraints.
     forcefield = app.ForceField("tip3p.xml")
 
+    nonbonded_method = app.PME if use_pme else app.Ewald
     system = forcefield.createSystem(
         pdb_file.topology,
-        nonbondedMethod=app.Ewald,
+        nonbondedMethod=nonbonded_method,
         nonbondedCutoff=8.0 * unit.angstrom,
         constraints=None,  # No constraints -> water not rigid
         rigidWater=False,
         removeCMMotion=True,
     )
+
+    # Set PME parameters to match TorchFF when alpha and kmax are provided.
+    if use_pme and alpha is not None and kmax is not None:
+        for f in system.getForces():
+            if isinstance(f, mm.NonbondedForce):
+                # alpha in 1/nm; nx=ny=nz=kmax for cubic box
+                f.setPMEParameters(alpha, kmax, kmax, kmax)
+                break
 
     timestep = 0.001 * unit.picoseconds
     integrator = mm.VerletIntegrator(timestep)

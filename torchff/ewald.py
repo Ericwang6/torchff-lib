@@ -40,7 +40,8 @@ class Ewald(nn.Module):
             return self._forward_python(coords, box, q, p, t)
 
     def _forward_python(self, coords, box, q, p=None, t=None):
-        box_inv = torch.inverse(box)
+        # box_inv = torch.inverse(box)
+        box_inv, _ = torch.linalg.inv_ex(box)
         V = torch.det(box)
 
         # Convert h,k,l indices to reciprocal space vectors
